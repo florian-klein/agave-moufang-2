@@ -14,6 +14,7 @@ pub mod banking_stage;
 pub mod banking_trace;
 #[allow(dead_code)]
 mod block_creation_loop;
+pub mod bls_sigverify;
 mod bls_sigverifier;
 pub mod cluster_info_vote_listener;
 pub mod cluster_slots_service;
