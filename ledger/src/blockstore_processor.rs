@@ -73,7 +73,7 @@ use {
         result,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc, Mutex, OnceLock, RwLock,
+            Arc, Barrier, Mutex, OnceLock, RwLock,
         },
         time::{Duration, Instant},
         vec::Drain,
@@ -4251,7 +4251,7 @@ pub mod tests {
         let (bank, _bank_forks) = Bank::new_with_mockup_builtin_for_tests(
             &genesis_config,
             mock_program_id,
-            MockBuiltinOk::vm,
+            MockBuiltinOk::register,
         );
 
         let tx = Transaction::new_signed_with_payer(
@@ -5790,6 +5790,47 @@ pub mod tests {
                 TransactionError::SignatureFailure
             ))
         );
+    }
+
+    #[test]
+    fn test_async_verification_progress_drop() {
+        let exit_barrier = Arc::new(Barrier::new(2));
+        let drop_barrier = Arc::new(Barrier::new(2));
+
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(1)
+            .exit_handler({
+                let exit_barrier = exit_barrier.clone();
+                move |_| {
+                    exit_barrier.wait();
+                }
+            })
+            .build()
+            .unwrap();
+
+        let mut progress = AsyncVerificationProgress::new();
+        progress
+            .spawn(&pool, &mut 0, &mut 0, {
+                let drop_barrier = drop_barrier.clone();
+                move || {
+                    // wait for the test to drop `progress` so the channel spawn() sends results to
+                    // gets disconnected
+                    drop_barrier.wait();
+                    AsyncVerificationResult {
+                        poh_verify_elapsed: 0,
+                        transaction_verify_elapsed: 0,
+                        error: None,
+                    }
+                }
+            })
+            .unwrap();
+
+        // ensure that in flight or pending tasks don't panic if AsyncVerificationProgress gets
+        // dropped
+        drop(progress);
+        drop_barrier.wait();
+        drop(pool);
+        exit_barrier.wait();
     }
 
     fn do_test_schedule_batches_for_execution(should_succeed: bool) {

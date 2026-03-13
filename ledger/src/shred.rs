@@ -729,96 +729,77 @@ where
     // for read-only validator to reduce overhead.
     debug_assert!(root < max_slot);
     let Some(shred) = layout::get_shred(packet) else {
-        // stats.index_overrun += 1;
         return true;
     };
     match layout::get_version(shred) {
         None => {
-            // stats.index_overrun += 1;
             return true;
         }
         Some(version) => {
             if version != shred_version {
-                // stats.shred_version_mismatch += 1;
                 return true;
             }
         }
     }
     let Ok(shred_variant) = layout::get_shred_variant(shred) else {
-        // stats.bad_shred_type += 1;
         return true;
     };
     let slot = match layout::get_slot(shred) {
         Some(slot) => {
             if slot > max_slot {
-                // stats.slot_out_of_range += 1;
                 return true;
             }
             slot
         }
         None => {
-            // stats.slot_bad_deserialize += 1;
             return true;
         }
     };
     let Some(index) = layout::get_index(shred) else {
-        // stats.index_bad_deserialize += 1;
         return true;
     };
     let Some(fec_set_index) = layout::get_fec_set_index(shred) else {
-        // stats.fec_set_index_bad_deserialize += 1;
         return true;
     };
 
     match ShredType::from(shred_variant) {
         ShredType::Code => {
             if index >= MAX_CODE_SHREDS_PER_SLOT as u32 {
-                // stats.index_out_of_bounds += 1;
                 return true;
             }
             if slot <= root {
-                // stats.slot_out_of_range += 1;
                 return true;
             }
 
             let Ok(erasure_config) = layout::get_erasure_config(shred) else {
-                // stats.erasure_config_bad_deserialize += 1;
                 return true;
             };
 
             if !erasure_config.is_fixed() {
-                // stats.misaligned_erasure_config += 1;
                 return true;
             }
         }
         ShredType::Data => {
             if index >= MAX_DATA_SHREDS_PER_SLOT as u32 {
-                // stats.index_out_of_bounds += 1;
                 return true;
             }
             let Some(parent_offset) = layout::get_parent_offset(shred) else {
-                // stats.bad_parent_offset += 1;
                 return true;
             };
             let Some(parent) = slot.checked_sub(Slot::from(parent_offset)) else {
-                // stats.bad_parent_offset += 1;
                 return true;
             };
             if !blockstore::verify_shred_slots(slot, parent, root) {
-                // stats.slot_out_of_range += 1;
                 return true;
             }
 
             let Ok(shred_flags) = layout::get_flags(shred) else {
-                // stats.shred_flags_bad_deserialize += 1;
                 return true;
             };
 
             if shred_flags.contains(ShredFlags::DATA_COMPLETE_SHRED)
                 && index != fec_set_index + DATA_SHREDS_PER_FEC_BLOCK as u32 - 1
             {
-                // stats.unexpected_data_complete_shred += 1;
-
                 if discard_unexpected_data_complete_shreds(slot) {
                     return true;
                 }
@@ -827,29 +808,18 @@ where
             if shred_flags.contains(ShredFlags::LAST_SHRED_IN_SLOT)
                 && !check_last_data_shred_index(index)
             {
-                // stats.misaligned_last_data_index += 1;
                 return true;
             }
         }
     }
 
     if !check_fixed_fec_set(index, fec_set_index) {
-        // stats.misaligned_fec_set += 1;
         return true;
     }
 
-    // LATENCY OPTIMIZATION: Skip merkle shred type counting.
-    // match shred_variant {
-    //     ShredVariant::MerkleCode { .. } => {
-    //         stats.num_shreds_merkle_code_chained =
-    //             stats.num_shreds_merkle_code_chained.saturating_add(1);
-    //     }
-    //     ShredVariant::MerkleData { .. } => {
-    //         stats.num_shreds_merkle_data_chained =
-    //             stats.num_shreds_merkle_data_chained.saturating_add(1);
-    //     }
-    // }
-    let _ = shred_variant; // silence unused warning
+    // LATENCY OPTIMIZATION: Stats collection and merkle shred type counting
+    // disabled for read-only validator to reduce overhead.
+    let _ = shred_variant;
     false
 }
 

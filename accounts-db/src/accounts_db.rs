@@ -5840,7 +5840,6 @@ impl AccountsDb {
     ) {
         let slot = storage.slot();
         let store_id = storage.id();
-        let zero_lamport_pubkeys_original_len = accum.zero_lamport_pubkeys.len();
 
         let mut accounts_data_len = 0;
         let mut stored_size_alive = 0;
@@ -5965,22 +5964,10 @@ impl AccountsDb {
             );
             accum.storage_info.push((store_id, info));
         }
-        // zero_lamport_pubkeys are candidates for cleaning. So add them to uncleaned_pubkeys
-        // for later cleaning. If there is just a single item, there is no cleaning to
-        // be done on that pubkey. Use only those pubkeys with multiple updates.
-        if accum.zero_lamport_pubkeys.len() != zero_lamport_pubkeys_original_len {
-            let old = self.uncleaned_pubkeys.insert(
-                slot,
-                accum.zero_lamport_pubkeys[zero_lamport_pubkeys_original_len..].to_vec(),
-            );
-            assert!(old.is_none());
-            // If obsolete accounts are enabled, add them as single ref accounts here
-            // to avoid having to revisit them later
-            // This is safe with obsolete accounts as all zero lamport accounts will be single ref
-            // or obsolete by the end of index generation
-            storage.batch_insert_zero_lamport_single_ref_account_offsets(zero_lamport_offsets);
-            accum.zero_lamport_pubkeys.clear();
-        }
+        // Add all zero lamport accounts as zero lamport single refs to avoid having to revisit
+        // them later. This is safe as all zero lamport accounts will be single ref or obsolete
+        // by the end of index generation
+        storage.batch_insert_zero_lamport_single_ref_account_offsets(zero_lamport_offsets);
 
         accum.num_accounts += insert_info.count as u64;
         accum.insert_time_us += insert_time_us;
