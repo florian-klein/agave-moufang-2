@@ -171,6 +171,7 @@ pub struct TvuConfig {
     pub replay_forks_threads: NonZeroUsize,
     pub replay_transactions_threads: NonZeroUsize,
     pub shred_sigverify_threads: NonZeroUsize,
+    pub bls_sigverify_threads: NonZeroUsize,
     pub xdp_sender: Option<XdpSender>,
     /// Enable shred arrival tracing to CSV files
     pub shred_arrival_tracing_enabled: bool,
@@ -197,6 +198,7 @@ impl Default for TvuConfig {
             replay_forks_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             replay_transactions_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             shred_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
+            bls_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             xdp_sender: None,
             shred_arrival_tracing_enabled: false,
             shred_arrival_output_dir: PathBuf::from("shred_arrivals"),
@@ -312,8 +314,7 @@ impl Tvu {
             bounded(MAX_ALPENGLOW_PACKET_NUM);
         let (consensus_metrics_sender, consensus_metrics_receiver) =
             bounded(MAX_IN_FLIGHT_CONSENSUS_EVENTS);
-        // TODO: once the bls sigverifier is upstreamed, it will need the sender side.
-        let (_reward_votes_sender, reward_votes_receiver) = bounded(MAX_ALPENGLOW_PACKET_NUM);
+        let (reward_votes_sender, reward_votes_receiver) = bounded(MAX_ALPENGLOW_PACKET_NUM);
 
         // The BLS socket is currently only available on Testnet and Development clusters.
         // Closer to release we will enable this for all clusters.
@@ -326,7 +327,7 @@ impl Tvu {
                     thread: bls_streamer_t,
                     key_updater: bls_key_updater,
                 },
-                _banlist,
+                banlist,
             ) = {
                 let quic_server_params = QuicStreamerConfig {
                     num_threads: NonZeroUsize::new(4.min(num_cpus::get())).unwrap(),
