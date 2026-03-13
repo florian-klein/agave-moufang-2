@@ -1083,10 +1083,8 @@ pub fn mock_process_instruction_with_feature_set<
 
     pre_adjustments(&mut invoke_context);
 
-    let compiled_ix = sanitized_message.instructions().first().unwrap();
-    let program_account_index = compiled_ix.program_id_index as u16;
     invoke_context
-        .prepare_top_level_instructions(&sanitized_message, &[program_account_index])
+        .prepare_top_level_instructions(&sanitized_message)
         .unwrap();
 
     let result = invoke_context.process_instruction(&mut 0, &mut ExecuteTimings::default());
