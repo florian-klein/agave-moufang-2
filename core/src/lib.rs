@@ -14,7 +14,7 @@ pub mod banking_stage;
 pub mod banking_trace;
 #[allow(dead_code)]
 mod block_creation_loop;
-pub mod bls_sigverify;
+mod bls_sigverifier;
 pub mod cluster_info_vote_listener;
 pub mod cluster_slots_service;
 pub mod commitment_service;
@@ -35,8 +35,10 @@ pub mod sample_performance_service;
 #[cfg(unix)]
 mod scheduler_bindings_server;
 mod shred_fetch_stage;
+pub mod shredstream;
 pub mod sigverify;
 pub mod sigverify_stage;
+pub mod slot_latency_tracker;
 pub mod snapshot_packager_service;
 pub mod staked_nodes_updater_service;
 pub mod stats_reporter_service;

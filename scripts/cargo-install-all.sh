@@ -180,11 +180,13 @@ cargo_build() {
 
 # This is called to detect both of unintended activation AND deactivation of
 # dcou, in order to make this rather fragile grep more resilient to bitrot...
+# Uses `cargo tree --no-dev` to check only non-dev dependencies, since
+# --unit-graph includes dev-dependency units and causes false positives
+# due to workspace feature unification.
 check_dcou() {
-  RUSTC_BOOTSTRAP=1 \
-    cargo_build -Z unstable-options --unit-graph "$@" | \
-    jq -r 'any(.units[].features[]?; . == "dev-context-only-utils")' | \
-    grep -q -F "true"
+  # shellcheck disable=SC2086
+  "$cargo" $maybeRustVersion tree -e features "$@" 2>/dev/null | \
+    grep -q -F 'dev-context-only-utils'
 }
 
 # Some binaries (like the notable agave-ledger-tool) need to activate
@@ -196,11 +198,10 @@ check_dcou() {
 # which don't depend on dcou as part of dependencies at all.
 (
   set -x
-  # Make sure dcou is really disabled by peeking the (unstable) build plan
-  # output after turning rustc into the nightly mode with RUSTC_BOOTSTRAP=1.
-  # In this way, additional requirement of nightly rustc toolchian is avoided.
-  # Note that `cargo tree` can't be used, because it doesn't support `--bin`.
-  if check_dcou "${binArgs[@]}" --workspace; then
+  # Make sure dcou is really disabled by checking the non-dev dependency tree
+  # for the main workspace. Using --no-dev avoids false positives from
+  # dev-dependency feature unification across workspace members.
+  if check_dcou --no-dev --workspace; then
      echo 'dcou feature activation is incorrectly activated!'
      exit 1
   fi
@@ -212,7 +213,7 @@ check_dcou() {
 
   # Finally, build the remaining dev tools with dcou.
   if [[ ${#dcouBinArgs[@]} -gt 0 ]]; then
-    if ! check_dcou --manifest-path "dev-bins/Cargo.toml" "${dcouBinArgs[@]}"; then
+    if ! check_dcou --manifest-path "dev-bins/Cargo.toml"; then
        echo 'dcou feature activation is incorrectly remain to be deactivated!'
        exit 1
     fi

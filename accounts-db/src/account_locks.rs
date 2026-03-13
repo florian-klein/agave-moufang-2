@@ -2,6 +2,8 @@
 use qualifier_attr::qualifiers;
 use {
     ahash::{AHashMap, AHashSet},
+    dashmap::DashMap,
+    smallvec::SmallVec,
     solana_message::AccountKeys,
     solana_pubkey::Pubkey,
     solana_transaction::sanitized::MAX_TX_ACCOUNT_LOCKS,
@@ -153,6 +155,178 @@ impl AccountLocks {
                 "Attempted to remove a write-lock for a key that wasn't write-locked"
             );
         }
+    }
+}
+
+/// Lock state for a single account: tracks separate read and write lock counts.
+/// Under SIMD83, a key may have both read and write locks from the same batch.
+#[derive(Debug, Default)]
+struct LockState {
+    readers: u64,
+    writers: u64,
+}
+
+/// DashMap-based concurrent account locks.
+/// Allows lock/unlock from multiple threads without a global Mutex.
+/// Uses per-key sharding for high concurrency.
+#[derive(Debug, Default)]
+pub struct ConcurrentAccountLocks {
+    locks: DashMap<Pubkey, LockState>,
+}
+
+impl ConcurrentAccountLocks {
+    /// Try to lock accounts for a single transaction.
+    /// Uses atomic entry-based operations with rollback on conflict.
+    pub fn try_lock_accounts<'a>(
+        &self,
+        keys: impl Iterator<Item = (&'a Pubkey, bool)> + Clone,
+    ) -> TransactionResult<()> {
+        // Collect keys so we can rollback on failure.
+        let keys_vec: SmallVec<[(&Pubkey, bool); 32]> = keys.collect();
+        let mut locked_count = 0usize;
+
+        for &(key, writable) in &keys_vec {
+            let success = if writable {
+                self.try_write_lock(key)
+            } else {
+                self.try_read_lock(key)
+            };
+
+            if !success {
+                // Rollback all locks acquired so far
+                for &(rkey, rwritable) in &keys_vec[..locked_count] {
+                    if rwritable {
+                        self.unlock_write(rkey);
+                    } else {
+                        self.unlock_read(rkey);
+                    }
+                }
+                return Err(TransactionError::AccountInUse);
+            }
+            locked_count += 1;
+        }
+        Ok(())
+    }
+
+    /// Lock accounts for all transactions in a batch (SIMD83).
+    /// Two-phase: first check all txs against existing locks (NOT against each other),
+    /// then lock all that passed. Intra-batch conflicts are intentionally allowed.
+    pub fn try_lock_transaction_batch<'a>(
+        &self,
+        mut validated_batch_keys: Vec<
+            TransactionResult<impl Iterator<Item = (&'a Pubkey, bool)> + Clone>,
+        >,
+    ) -> Vec<TransactionResult<()>> {
+        // Phase 1: Check each tx against existing locks only (not against each other)
+        validated_batch_keys.iter_mut().for_each(|validated_keys| {
+            if let Ok(keys) = validated_keys.as_ref() {
+                for (key, writable) in keys.clone() {
+                    let conflict = if writable {
+                        // Write conflicts with any existing lock
+                        self.locks.get(key).is_some_and(|v| v.readers > 0 || v.writers > 0)
+                    } else {
+                        // Read only conflicts with existing write lock
+                        self.locks.get(key).is_some_and(|v| v.writers > 0)
+                    };
+                    if conflict {
+                        *validated_keys = Err(TransactionError::AccountInUse);
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Phase 2: Lock all txs that passed validation
+        // Under SIMD83, intra-batch conflicts are allowed, so multiple
+        // writers in the same batch increment the writer count.
+        validated_batch_keys
+            .into_iter()
+            .map(|result| {
+                result.map(|keys| {
+                    for (key, writable) in keys {
+                        let mut entry = self.locks.entry(*key).or_default();
+                        if writable {
+                            entry.writers += 1;
+                        } else {
+                            entry.readers += 1;
+                        }
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Unlock accounts after a transaction completes.
+    pub fn unlock_accounts<'a>(&self, keys: impl Iterator<Item = (&'a Pubkey, bool)>) {
+        for (key, writable) in keys {
+            if writable {
+                self.unlock_write(key);
+            } else {
+                self.unlock_read(key);
+            }
+        }
+    }
+
+    fn try_read_lock(&self, key: &Pubkey) -> bool {
+        let mut entry = self.locks.entry(*key).or_default();
+        // Read lock fails if account is write-locked
+        if entry.writers == 0 {
+            entry.readers += 1;
+            true
+        } else {
+            if entry.readers == 0 && entry.writers == 0 {
+                drop(entry);
+                self.locks.remove(key);
+            }
+            false
+        }
+    }
+
+    fn try_write_lock(&self, key: &Pubkey) -> bool {
+        let mut entry = self.locks.entry(*key).or_default();
+        // Write lock fails if account is read-locked or write-locked
+        if entry.readers == 0 && entry.writers == 0 {
+            entry.writers = 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn unlock_read(&self, key: &Pubkey) {
+        if let Some(mut entry) = self.locks.get_mut(key) {
+            debug_assert!(entry.readers > 0, "unlock_read on non-read-locked key");
+            entry.readers -= 1;
+            if entry.readers == 0 && entry.writers == 0 {
+                drop(entry);
+                self.locks.remove(key);
+            }
+        } else {
+            debug_assert!(false, "unlock_read on non-existent key");
+        }
+    }
+
+    fn unlock_write(&self, key: &Pubkey) {
+        if let Some(mut entry) = self.locks.get_mut(key) {
+            debug_assert!(entry.writers > 0, "unlock_write on non-write-locked key");
+            entry.writers -= 1;
+            if entry.readers == 0 && entry.writers == 0 {
+                drop(entry);
+                self.locks.remove(key);
+            }
+        } else {
+            debug_assert!(false, "unlock_write on non-existent key");
+        }
+    }
+
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn is_locked_readonly(&self, key: &Pubkey) -> bool {
+        self.locks.get(key).is_some_and(|v| v.readers > 0)
+    }
+
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn is_locked_write(&self, key: &Pubkey) -> bool {
+        self.locks.get(key).is_some_and(|v| v.writers > 0)
     }
 }
 

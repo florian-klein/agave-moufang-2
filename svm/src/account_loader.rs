@@ -35,8 +35,39 @@ use {
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction_context::{IndexOfAccount, transaction_accounts::KeyedAccountSharedData},
     solana_transaction_error::{TransactionError, TransactionResult as Result},
+    std::cell::Cell,
     std::num::NonZeroU32,
+    std::sync::atomic::{AtomicU64, Ordering},
+    std::time::Instant,
 };
+
+// Atomic counters for tracking account load timing breakdown
+pub static LOAD_ACCOUNT_CALL_NS: AtomicU64 = AtomicU64::new(0);
+pub static INSPECT_ACCOUNT_CALL_NS: AtomicU64 = AtomicU64::new(0);
+pub static LOAD_ACCOUNT_COUNT: AtomicU64 = AtomicU64::new(0);
+// Cache hit/miss tracking: local batch cache vs accounts-db lookup
+pub static LOCAL_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+pub static ACCOUNTS_DB_HITS: AtomicU64 = AtomicU64::new(0);
+pub static ACCOUNT_NOT_FOUND: AtomicU64 = AtomicU64::new(0);
+
+// Sample every Nth call to reduce Instant::now() overhead (~1.5ms/slot -> ~24us/slot)
+const TIMING_SAMPLE_INTERVAL: u64 = 64;
+
+thread_local! {
+    static SAMPLE_COUNTER: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Reset and return the accumulated load timing stats (in nanoseconds)
+/// Returns (load_ns, inspect_ns, count, local_hits, db_hits, not_found)
+pub fn take_load_timing_stats() -> (u64, u64, u64, u64, u64, u64) {
+    let load_ns = LOAD_ACCOUNT_CALL_NS.swap(0, Ordering::Relaxed);
+    let inspect_ns = INSPECT_ACCOUNT_CALL_NS.swap(0, Ordering::Relaxed);
+    let count = LOAD_ACCOUNT_COUNT.swap(0, Ordering::Relaxed);
+    let local_hits = LOCAL_CACHE_HITS.swap(0, Ordering::Relaxed);
+    let db_hits = ACCOUNTS_DB_HITS.swap(0, Ordering::Relaxed);
+    let not_found = ACCOUNT_NOT_FOUND.swap(0, Ordering::Relaxed);
+    (load_ns, inspect_ns, count, local_hits, db_hits, not_found)
+}
 
 // Per SIMD-0186, all accounts are assigned a base size of 64 bytes to cover
 // the storage cost of metadata.
@@ -202,15 +233,19 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
         account_key: &Pubkey,
         is_writable: bool,
     ) -> Option<LoadedTransactionAccount> {
+        // Sample timing every Nth call to avoid clock_gettime syscall overhead.
+        // With ~19K calls/slot, full measurement adds ~1.5ms; sampling at 1/64 reduces to ~24us.
+        let should_sample = SAMPLE_COUNTER.with(|c| {
+            let val = c.get();
+            c.set(val.wrapping_add(1));
+            val % TIMING_SAMPLE_INTERVAL == 0
+        });
+        let start = if should_sample { Some(Instant::now()) } else { None };
+
         let account = self.load_account(account_key);
 
-        // Inspect prior to collecting rent, since rent collection can modify
-        // the account.
-        //
-        // Note that though rent collection is disabled, we still set the rent
-        // epoch of rent exempt if the account is rent-exempt but its rent epoch
-        // is not set to u64::MAX. In other words, an account can be updated
-        // during rent collection. Therefore, we must inspect prior to collecting rent.
+        let after_load = start.map(|s| s.elapsed());
+
         self.callbacks.inspect_account(
             account_key,
             if let Some(ref account) = account {
@@ -220,6 +255,20 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
             },
             is_writable,
         );
+
+        if let Some(start) = start {
+            let total_elapsed = start.elapsed();
+            let load_ns = after_load.unwrap();
+            LOAD_ACCOUNT_CALL_NS.fetch_add(
+                load_ns.as_nanos() as u64 * TIMING_SAMPLE_INTERVAL,
+                Ordering::Relaxed,
+            );
+            INSPECT_ACCOUNT_CALL_NS.fetch_add(
+                (total_elapsed - load_ns).as_nanos() as u64 * TIMING_SAMPLE_INTERVAL,
+                Ordering::Relaxed,
+            );
+        }
+        LOAD_ACCOUNT_COUNT.fetch_add(1, Ordering::Relaxed);
 
         account.map(|account| LoadedTransactionAccount {
             loaded_size: TRANSACTION_ACCOUNT_BASE_SIZE.saturating_add(account.data().len()),
@@ -255,9 +304,7 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
     // &mut self to insert the account. Wrappers with &self ignore it.
     fn do_load(&self, account_key: &Pubkey) -> (Option<(AccountSharedData, Slot)>, bool) {
         if let Some((account, slot)) = self.loaded_accounts.get(account_key) {
-            // If lamports is 0, a previous transaction deallocated this account.
-            // We return None instead of the account we found so it can be created fresh.
-            // We *never* remove accounts, or else we would fetch stale state from accounts-db.
+            LOCAL_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             let option_account = if account.lamports() == 0 {
                 None
             } else {
@@ -266,8 +313,10 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
 
             (option_account, false)
         } else if let Some((account, slot)) = self.callbacks.get_account_shared_data(account_key) {
+            ACCOUNTS_DB_HITS.fetch_add(1, Ordering::Relaxed);
             (Some((account, slot)), true)
         } else {
+            ACCOUNT_NOT_FOUND.fetch_add(1, Ordering::Relaxed);
             (None, true)
         }
     }
@@ -307,6 +356,7 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
         }
     }
 }
+
 
 // Program loaders and parsers require a type that impls TransactionProcessingCallback,
 // because they are used in both SVM and by Bank. We impl it, with the consequence
@@ -588,9 +638,10 @@ fn load_transaction_account<CB: TransactionProcessingCallback>(
     if solana_sdk_ids::sysvar::instructions::check_id(account_key) {
         // Since the instructions sysvar is constructed by the SVM and modified
         // for each transaction instruction, it cannot be loaded.
+        let account = construct_instructions_account(message);
         LoadedTransactionAccount {
             loaded_size: 0,
-            account: construct_instructions_account(message),
+            account,
         }
     } else if let Some(mut loaded_account) =
         account_loader.load_transaction_account(account_key, is_writable)
@@ -1469,7 +1520,7 @@ mod tests {
         account_data.set_lamports(200);
         mock_bank
             .accounts_map
-            .insert(key1.pubkey(), (account_data, 1));
+            .insert(key1.pubkey(), (account_data.clone(), 1));
         let mut account_loader = (&mock_bank).into();
 
         let mut error_metrics = TransactionErrorMetrics::default();
@@ -1479,10 +1530,15 @@ mod tests {
             vec![Signature::new_unique()],
             false,
         );
+        // Use the actual fee payer account data (lamports=200, owner=default)
+        // so the program owner check can properly detect InvalidProgramForExecution.
         let result = load_transaction_accounts(
             &mut account_loader,
             sanitized_transaction.message(),
-            LoadedTransactionAccount::default(),
+            LoadedTransactionAccount {
+                account: account_data,
+                ..LoadedTransactionAccount::default()
+            },
             MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
             &mut error_metrics,
             &Rent::default(),

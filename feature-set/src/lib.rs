@@ -37,8 +37,16 @@ impl FeatureSet {
         &self.active
     }
 
+    pub fn active_mut(&mut self) -> &mut AHashMap<Pubkey, u64> {
+        &mut self.active
+    }
+
     pub fn inactive(&self) -> &AHashSet<Pubkey> {
         &self.inactive
+    }
+
+    pub fn inactive_mut(&mut self) -> &mut AHashSet<Pubkey> {
+        &mut self.inactive
     }
 
     pub fn is_active(&self, feature_id: &Pubkey) -> bool {

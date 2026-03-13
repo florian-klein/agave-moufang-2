@@ -206,6 +206,22 @@ impl VotingService {
                 let mut measure = Measure::start("alpenglow vote history save");
                 if let Err(err) = vote_history_storage.store(&saved_vote_history) {
                     error!("Unable to save vote history to storage: {err:?}");
+                    let crash_msg = format!("FATAL: Unable to save vote history to storage: {err:?}");
+                    eprintln!("{crash_msg}");
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/var/solana/data/validator-crash.log")
+                    {
+                        use std::io::Write;
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let _ = writeln!(f, "[{ts}] {crash_msg}");
+                        let _ = f.flush();
+                    }
                     std::process::exit(1);
                 }
                 measure.stop();

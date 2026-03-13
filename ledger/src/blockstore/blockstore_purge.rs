@@ -39,9 +39,24 @@ impl Blockstore {
     /// `AddressSignature`, and `cf::TransactionStatusIndex`, are cleaned-up
     /// based on the `purge_type` setting.
     pub fn purge_slots(&self, from_slot: Slot, to_slot: Slot, purge_type: PurgeType) -> Result<()> {
+        // Evict non-shred caches first (these aren't read by purge_range)
+        let in_range = |slot: Slot| slot >= from_slot && slot <= to_slot;
+        self.slot_meta_cache.retain(|&slot, _| !in_range(slot));
+        self.index_cache.retain(|&slot, _| !in_range(slot));
+        self.orphans_cache.retain(|&slot, _| !in_range(slot));
+        self.dead_slots_cache.retain(|&slot, _| !in_range(slot));
+        self.erasure_meta_cache.retain(|&(slot, _), _| !in_range(slot));
+        self.merkle_root_meta_cache.retain(|&(slot, _), _| !in_range(slot));
+
         let mut purge_stats = PurgeStats::default();
+        // purge_range -> purge_special_columns_exact reads shred data, so
+        // shred caches must remain intact until after this completes.
         let purge_result =
             self.run_purge_with_stats(from_slot, to_slot, purge_type, &mut purge_stats);
+
+        // Now safe to evict shred caches
+        self.shred_data_cache.retain(|&slot, _| !in_range(slot));
+        self.shred_code_cache.retain(|&slot, _| !in_range(slot));
 
         datapoint_info!(
             "blockstore-purge",
@@ -148,7 +163,22 @@ impl Blockstore {
         };
         let mut write_batch = self.get_write_batch()?;
 
+        // Evict non-shred caches before purge (these aren't needed by purge_range)
+        self.index_cache.remove(&slot);
+        self.orphans_cache.remove(&slot);
+        self.dead_slots_cache.remove(&slot);
+        self.erasure_meta_cache.retain(|&(s, _), _| s != slot);
+        self.merkle_root_meta_cache.retain(|&(s, _), _| s != slot);
+
+        // purge_range -> purge_special_columns_exact reads shred data to find
+        // transaction signatures for cleanup. The shred data cache must remain
+        // intact here because shreds may only exist in the in-memory cache
+        // (not in RocksDB) due to the write-bypass optimization.
         self.purge_range(&mut write_batch, slot, slot, PurgeType::Exact)?;
+
+        // Now safe to evict shred caches — purge_range has finished reading them
+        self.shred_data_cache.remove(&slot);
+        self.shred_code_cache.remove(&slot);
 
         if let Some(parent_slot) = slot_meta.parent_slot {
             let parent_slot_meta = self.meta(parent_slot)?;
@@ -158,6 +188,7 @@ impl Blockstore {
                 parent_slot_meta
                     .next_slots
                     .retain(|&next_slot| next_slot != slot);
+                self.slot_meta_cache.insert(parent_slot, parent_slot_meta.clone());
                 self.meta_cf
                     .put_in_batch(&mut write_batch, parent_slot, &parent_slot_meta)?;
             } else {
@@ -170,6 +201,7 @@ impl Blockstore {
 
         // Retain a SlotMeta for `slot` with the `next_slots` field retained
         slot_meta.clear_unconfirmed_slot();
+        self.slot_meta_cache.insert(slot, slot_meta.clone());
         self.meta_cf
             .put_in_batch(&mut write_batch, slot, &slot_meta)?;
 

@@ -43,7 +43,6 @@ use {
             },
         },
         bank_forks::BankForks,
-        block_component_processor::BlockComponentProcessor,
         epoch_stakes::{
             BLSPubkeyToRankMap, DeserializableVersionedEpochStakes, NodeVoteAccounts,
             VersionedEpochStakes,
@@ -128,7 +127,7 @@ use {
     solana_precompile_error::PrecompileError,
     solana_program_runtime::{
         invoke_context::BuiltinFunctionRegisterer,
-        loaded_programs::{ProgramCacheEntry, ProgramRuntimeEnvironment},
+        loaded_programs::{ProgramCacheEntry, ProgramRuntimeEnvironments},
     },
     solana_pubkey::{Pubkey, PubkeyHasherBuilder},
     solana_rent::Rent,
@@ -141,11 +140,13 @@ use {
     solana_slot_hashes::SlotHashes,
     solana_slot_history::{Check, SlotHistory},
     solana_stake_interface::{
-        stake_history::StakeHistory, state::Delegation, sysvar::stake_history,
+        program as stake_program, stake_history::StakeHistory, state::Delegation,
+        sysvar::stake_history,
     },
     solana_svm::{
         account_loader::LoadedTransaction,
         account_overrides::AccountOverrides,
+        global_shm_plugin,
         program_loader::load_program_with_pubkey,
         transaction_balances::{BalanceCollector, SvmTokenInfo},
         transaction_commit_result::{CommittedTransaction, TransactionCommitResult},
@@ -537,7 +538,6 @@ impl PartialEq for Bank {
             rc: _,
             status_cache: _,
             blockhash_queue,
-            max_processing_age,
             ancestors: _,
             hash,
             parent_hash,
@@ -600,13 +600,11 @@ impl PartialEq for Bank {
             expected_bank_hash: _,
             bank_hash_stats: _,
             epoch_rewards_calculation_cache: _,
-            block_component_processor: _,
             // Ignore new fields explicitly if they do not impact PartialEq.
             // Adding ".." will remove compile-time checks that if a new field
             // is added to the struct, this PartialEq is accordingly updated.
         } = self;
         *blockhash_queue.read().unwrap() == *other.blockhash_queue.read().unwrap()
-            && *max_processing_age == other.max_processing_age
             && *hash.read().unwrap() == *other.hash.read().unwrap()
             && parent_hash == &other.parent_hash
             && parent_slot == &other.parent_slot
@@ -755,9 +753,6 @@ pub struct Bank {
 
     /// FIFO queue of `recent_blockhash` items
     blockhash_queue: RwLock<BlockhashQueue>,
-
-    /// Maximum age in slots a blockhash can be for a tx to be processed.
-    max_processing_age: usize,
 
     /// The set of parents including this bank
     pub ancestors: Ancestors,
@@ -947,11 +942,6 @@ pub struct Bank {
     /// This is used to avoid recalculating the same epoch rewards at epoch boundary.
     /// The hashmap is keyed by parent_hash.
     epoch_rewards_calculation_cache: Arc<Mutex<HashMap<Hash, Arc<PartitionedRewardsCalculation>>>>,
-
-    /// Block component processor for validating block headers/footers and clock bounds. We
-    /// currently write to this during replay, as we process block components one at a time, and
-    /// read from this once replay is complete.
-    pub block_component_processor: RwLock<BlockComponentProcessor>,
 }
 
 #[derive(Debug)]
@@ -1098,7 +1088,6 @@ impl Bank {
             rc: BankRc::new(accounts),
             status_cache: Arc::<RwLock<BankStatusCache>>::default(),
             blockhash_queue: RwLock::<BlockhashQueue>::default(),
-            max_processing_age: MAX_PROCESSING_AGE,
             ancestors: Ancestors::default(),
             hash: RwLock::<Hash>::default(),
             parent_hash: Hash::default(),
@@ -1161,7 +1150,6 @@ impl Bank {
             expected_bank_hash: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: Arc::new(Mutex::new(HashMap::default())),
-            block_component_processor: RwLock::new(BlockComponentProcessor::default()),
         };
 
         bank.transaction_processor =
@@ -1336,7 +1324,7 @@ impl Bank {
             bank_id,
             epoch,
             blockhash_queue,
-            max_processing_age: parent.max_processing_age,
+
             // TODO: clean this up, so much special-case copying...
             hashes_per_tick: parent.hashes_per_tick,
             ticks_per_slot: parent.ticks_per_slot,
@@ -1414,7 +1402,6 @@ impl Bank {
             expected_bank_hash: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: parent.epoch_rewards_calculation_cache.clone(),
-            block_component_processor: RwLock::new(BlockComponentProcessor::default()),
         };
 
         let (_, ancestors_time_us) = measure_us!({
@@ -1558,9 +1545,10 @@ impl Bank {
             .write()
             .unwrap();
 
-        if let Some(upcoming_environment) = epoch_boundary_preparation.upcoming_environment.as_ref()
+        if let Some(upcoming_environments) =
+            epoch_boundary_preparation.upcoming_environments.as_ref()
         {
-            let upcoming_environment = upcoming_environment.clone();
+            let upcoming_environments = upcoming_environments.clone();
             if let Some((key, program_to_recompile)) =
                 epoch_boundary_preparation.programs_to_recompile.pop()
             {
@@ -1568,7 +1556,7 @@ impl Bank {
                 drop(program_cache);
                 if let Some((recompiled, last_modification_slot)) = load_program_with_pubkey(
                     self,
-                    &upcoming_environment,
+                    &upcoming_environments.program_runtime_v1,
                     &key,
                     self.slot,
                     &mut ExecuteTimings::default(),
@@ -1585,7 +1573,7 @@ impl Bank {
                         .write()
                         .unwrap();
                     program_cache.assign_program(
-                        &upcoming_environment,
+                        &upcoming_environments,
                         key,
                         last_modification_slot,
                         recompiled,
@@ -1595,14 +1583,21 @@ impl Bank {
         } else if slot_index.saturating_add(slots_in_recompilation_phase) >= slots_in_epoch {
             // Anticipate the upcoming program runtime environment for the next epoch,
             // so we can try to recompile loaded programs before the feature transition hits.
-            let new_environment = self.create_program_runtime_environment(&upcoming_feature_set);
-            let mut upcoming_environment = self
-                .transaction_processor
-                .program_runtime_environment
-                .clone();
-            let changed_program_runtime_environment = *upcoming_environment != *new_environment;
-            if changed_program_runtime_environment {
-                upcoming_environment = new_environment;
+            let new_environments = self.create_program_runtime_environments(&upcoming_feature_set);
+            let mut upcoming_environments = self.transaction_processor.environments.clone();
+            let changed_program_runtime_v1 =
+                *upcoming_environments.program_runtime_v1 != *new_environments.program_runtime_v1;
+            let changed_program_runtime_v2 =
+                *upcoming_environments.program_runtime_v2 != *new_environments.program_runtime_v2;
+            if changed_program_runtime_v1 {
+                upcoming_environments.program_runtime_v1 = new_environments.program_runtime_v1;
+            }
+            if changed_program_runtime_v2 {
+                upcoming_environments.program_runtime_v2 = new_environments.program_runtime_v2;
+            }
+            epoch_boundary_preparation.upcoming_epoch = self.epoch.saturating_add(1);
+            epoch_boundary_preparation.upcoming_environments = Some(upcoming_environments);
+            if changed_program_runtime_v1 {
                 epoch_boundary_preparation.programs_to_recompile = program_cache
                     .get_flattened_entries()
                     .into_iter()
@@ -1614,13 +1609,11 @@ impl Bank {
             } else {
                 epoch_boundary_preparation.programs_to_recompile.clear();
             }
-            epoch_boundary_preparation.upcoming_epoch = self.epoch.saturating_add(1);
-            epoch_boundary_preparation.upcoming_environment = Some(upcoming_environment);
         }
     }
 
     pub fn prune_program_cache(&self, new_root_slot: Slot, new_root_epoch: Epoch) {
-        let upcoming_environment = self
+        let upcoming_environments = self
             .transaction_processor
             .epoch_boundary_preparation
             .write()
@@ -1630,7 +1623,7 @@ impl Bank {
             .global_program_cache
             .write()
             .unwrap()
-            .prune(new_root_slot, upcoming_environment);
+            .prune(new_root_slot, upcoming_environments);
     }
 
     pub fn prune_program_cache_by_deployment_slot(&self, deployment_slot: Slot) {
@@ -1784,10 +1777,9 @@ impl Bank {
             rewards_metrics,
         );
 
-        let program_runtime_environment =
-            self.create_program_runtime_environment(&self.feature_set);
+        let new_environments = self.create_program_runtime_environments(&self.feature_set);
         self.transaction_processor
-            .set_program_runtime_environment(program_runtime_environment);
+            .set_environments(new_environments);
     }
 
     pub fn byte_limit_for_scans(&self) -> Option<usize> {
@@ -1906,7 +1898,6 @@ impl Bank {
             rc: bank_rc,
             status_cache: Arc::<RwLock<BankStatusCache>>::default(),
             blockhash_queue: RwLock::new(fields.blockhash_queue),
-            max_processing_age: MAX_PROCESSING_AGE,
             ancestors,
             hash: RwLock::new(fields.hash),
             parent_hash: fields.parent_hash,
@@ -1975,7 +1966,6 @@ impl Bank {
             bank_hash_stats: AtomicBankHashStats::new(&fields.bank_hash_stats),
             epoch_rewards_calculation_cache: Arc::new(Mutex::new(HashMap::default())),
             expected_bank_hash: RwLock::new(None),
-            block_component_processor: RwLock::new(BlockComponentProcessor::default()),
         };
 
         // Sanity assertions between bank snapshot and genesis config
@@ -2154,6 +2144,9 @@ impl Bank {
         // although there is no such sysvars currently.
         self.adjust_sysvar_balance_for_rent(&mut new_account);
         self.store_account_and_update_capitalization(pubkey, &new_account);
+
+        // Notify ShmPlugin of sysvar update
+        global_shm_plugin().filtered_write(pubkey.as_array(), new_account.data(), &[0u8; 64]);
     }
 
     fn inherit_specially_retained_account_fields(
@@ -2459,10 +2452,6 @@ impl Bank {
         //  an epoch as a fraction of a year
         //  calculated as: slots_elapsed / (slots / year)
         self.epoch_schedule().get_slots_in_epoch(epoch) as f64 / self.slots_per_year
-    }
-
-    pub fn max_processing_age(&self) -> usize {
-        self.max_processing_age
     }
 
     // Calculates the starting-slot for inflation from the activation slot.
@@ -2911,7 +2900,7 @@ impl Bank {
 
     pub fn is_blockhash_valid(&self, hash: &Hash) -> bool {
         let blockhash_queue = self.blockhash_queue.read().unwrap();
-        blockhash_queue.is_hash_valid_for_age(hash, self.max_processing_age)
+        blockhash_queue.is_hash_valid_for_age(hash, MAX_PROCESSING_AGE)
     }
 
     pub fn get_minimum_balance_for_rent_exemption(&self, data_len: usize) -> u64 {
@@ -2966,7 +2955,7 @@ impl Bank {
         // length is made variable by epoch
         blockhash_queue
             .get_hash_age(blockhash)
-            .map(|age| self.block_height + self.max_processing_age as u64 - age)
+            .map(|age| self.block_height + MAX_PROCESSING_AGE as u64 - age)
     }
 
     /// Query the alpenglow genesis certificate account.
@@ -3335,6 +3324,23 @@ impl Bank {
         batch
     }
 
+    /// Prepare a transaction batch from a single already-sanitized transaction
+    /// without locking or re-validating account locks. The transaction was
+    /// already validated during sanitization, so duplicate-key and lock-limit
+    /// checks are redundant here.
+    pub fn prepare_unlocked_batch_from_single_tx_unchecked<'a, Tx: SVMMessage>(
+        &'a self,
+        transaction: &'a Tx,
+    ) -> TransactionBatch<'a, 'a, Tx> {
+        let mut batch = TransactionBatch::new(
+            vec![Ok(())],
+            self,
+            OwnedOrBorrowed::Borrowed(slice::from_ref(transaction)),
+        );
+        batch.set_needs_unlock(false);
+        batch
+    }
+
     /// Prepare a transaction batch from a single transaction after locking accounts
     pub fn prepare_locked_batch_from_single_tx<'a, Tx: TransactionWithMeta>(
         &'a self,
@@ -3409,8 +3415,7 @@ impl Bank {
             // After simulation, transactions will need to be forwarded to the leader
             // for processing. During forwarding, the transaction could expire if the
             // delay is not accounted for.
-            self.max_processing_age
-                .saturating_sub(MAX_TRANSACTION_FORWARDING_DELAY),
+            MAX_PROCESSING_AGE - MAX_TRANSACTION_FORWARDING_DELAY,
             &mut timings,
             &mut TransactionErrorMetrics::default(),
             TransactionProcessingConfig {
@@ -3603,13 +3608,13 @@ impl Bank {
             blockhash_lamports_per_signature,
             epoch_total_stake: self.get_current_epoch_total_stake(),
             feature_set: self.feature_set.runtime_features(),
-            program_runtime_environment_for_execution: self
+            program_runtime_environments_for_execution: self
                 .transaction_processor
-                .program_runtime_environment
+                .environments
                 .clone(),
-            program_runtime_environment_for_deployment: self
+            program_runtime_environments_for_deployment: self
                 .transaction_processor
-                .program_runtime_environment_for_epoch(effective_epoch_of_deployments),
+                .get_environments_for_epoch(effective_epoch_of_deployments),
             rent: self.rent_collector.rent.clone(),
         };
 
@@ -3961,7 +3966,7 @@ impl Bank {
                                     .unwrap()
                             })
                             .merge(
-                                &self.transaction_processor.program_runtime_environment,
+                                &self.transaction_processor.environments,
                                 self.slot,
                                 programs_modified_by_tx,
                             );
@@ -3983,6 +3988,8 @@ impl Bank {
             .sum();
         self.update_accounts_data_size_delta_on_chain(accounts_data_len_delta);
 
+        // Must keep update_transaction_statuses - status cache used for duplicate detection
+        // and may affect consensus state tracking.
         let ((), update_transaction_statuses_us) =
             measure_us!(self.update_transaction_statuses(sanitized_txs, &processing_results));
 
@@ -4099,12 +4106,14 @@ impl Bank {
     pub fn load_execute_and_commit_transactions(
         &self,
         batch: &TransactionBatch<impl TransactionWithMeta>,
+        max_age: usize,
         recording_config: ExecutionRecordingConfig,
         timings: &mut ExecuteTimings,
         log_messages_bytes_limit: Option<usize>,
     ) -> (Vec<TransactionCommitResult>, Option<BalanceCollector>) {
         self.do_load_execute_and_commit_transactions_with_pre_commit_callback(
             batch,
+            max_age,
             recording_config,
             timings,
             log_messages_bytes_limit,
@@ -4116,6 +4125,7 @@ impl Bank {
     pub fn load_execute_and_commit_transactions_with_pre_commit_callback<'a>(
         &'a self,
         batch: &TransactionBatch<impl TransactionWithMeta>,
+        max_age: usize,
         recording_config: ExecutionRecordingConfig,
         timings: &mut ExecuteTimings,
         log_messages_bytes_limit: Option<usize>,
@@ -4126,6 +4136,7 @@ impl Bank {
     ) -> Result<(Vec<TransactionCommitResult>, Option<BalanceCollector>)> {
         self.do_load_execute_and_commit_transactions_with_pre_commit_callback(
             batch,
+            max_age,
             recording_config,
             timings,
             log_messages_bytes_limit,
@@ -4136,6 +4147,7 @@ impl Bank {
     fn do_load_execute_and_commit_transactions_with_pre_commit_callback<'a>(
         &'a self,
         batch: &TransactionBatch<impl TransactionWithMeta>,
+        max_age: usize,
         recording_config: ExecutionRecordingConfig,
         timings: &mut ExecuteTimings,
         log_messages_bytes_limit: Option<usize>,
@@ -4149,7 +4161,7 @@ impl Bank {
             balance_collector,
         } = self.load_and_execute_transactions(
             batch,
-            self.max_processing_age,
+            max_age,
             timings,
             &mut TransactionErrorMetrics::default(),
             TransactionProcessingConfig {
@@ -4199,6 +4211,7 @@ impl Bank {
 
         let (mut commit_results, ..) = self.load_execute_and_commit_transactions(
             &batch,
+            MAX_PROCESSING_AGE,
             ExecutionRecordingConfig {
                 enable_cpi_recording: false,
                 enable_log_recording: true,
@@ -4241,6 +4254,7 @@ impl Bank {
     ) -> Vec<Result<()>> {
         self.load_execute_and_commit_transactions(
             batch,
+            MAX_PROCESSING_AGE,
             ExecutionRecordingConfig::new_single_setting(false),
             &mut ExecuteTimings::default(),
             None,
@@ -4424,8 +4438,7 @@ impl Bank {
 
         self.apply_simd_0339_invoke_cost_changes();
 
-        let program_runtime_environment =
-            self.create_program_runtime_environment(&self.feature_set);
+        let environments = self.create_program_runtime_environments(&self.feature_set);
         self.transaction_processor
             .global_program_cache
             .write()
@@ -4436,20 +4449,20 @@ impl Bank {
             .write()
             .unwrap()
             .upcoming_epoch = self.epoch;
-        self.transaction_processor.program_runtime_environment = program_runtime_environment;
+        self.transaction_processor.environments = environments;
     }
 
-    fn create_program_runtime_environment(
+    fn create_program_runtime_environments(
         &self,
         feature_set: &FeatureSet,
-    ) -> ProgramRuntimeEnvironment {
+    ) -> ProgramRuntimeEnvironments {
         let simd_0268_active = feature_set.is_active(&raise_cpi_nesting_limit_to_8::id());
         let compute_budget = self
             .compute_budget()
             .as_ref()
             .unwrap_or(&ComputeBudget::new_with_defaults(simd_0268_active))
             .to_budget();
-        Arc::new(
+        let program_runtime_environment = Arc::new(
             create_program_runtime_environment(
                 &feature_set.runtime_features(),
                 &compute_budget,
@@ -4457,7 +4470,11 @@ impl Bank {
                 false, /* debugging_features */
             )
             .unwrap(),
-        )
+        );
+        ProgramRuntimeEnvironments {
+            program_runtime_v1: program_runtime_environment.clone(),
+            program_runtime_v2: program_runtime_environment,
+        }
     }
 
     pub fn set_tick_height(&self, tick_height: u64) {
@@ -4563,6 +4580,76 @@ impl Bank {
         pubkey: &Pubkey,
     ) -> Option<(AccountSharedData, Slot)> {
         self.rc.accounts.load_with_fixed_root(ancestors, pubkey)
+    }
+
+    /// Prefetch accounts into the read cache in parallel.
+    /// This is used to warm the cache before transaction execution,
+    /// reducing latency by overlapping I/O with other processing.
+    ///
+    /// The accounts are loaded using rayon's parallel iterator,
+    /// which populates the accounts DB read cache as a side effect.
+    /// The actual account data is not returned - only the cache warming matters.
+    pub fn prefetch_accounts(&self, pubkeys: &[Pubkey], thread_pool: &rayon::ThreadPool) {
+        use rayon::prelude::*;
+
+        if pubkeys.is_empty() {
+            return;
+        }
+
+        let ancestors = &self.ancestors;
+        let accounts = &self.rc.accounts;
+
+        thread_pool.install(|| {
+            pubkeys.par_iter().for_each(|pubkey| {
+                // Load the account - this populates the read cache
+                let _ = accounts.load_with_fixed_root(ancestors, pubkey);
+            });
+        });
+    }
+
+    /// Prefetch accounts into the read cache for faster subsequent access.
+    /// Uses rayon for parallel loading since account loading is I/O bound.
+    pub fn prefetch_accounts_into_read_cache(&self, pubkeys: &[Pubkey]) {
+        if pubkeys.is_empty() {
+            return;
+        }
+        let ancestors = &self.ancestors;
+        let accounts = &self.rc.accounts;
+        pubkeys.iter().for_each(|pubkey| {
+            accounts.load_account_into_read_cache(ancestors, pubkey);
+        });
+    }
+
+    /// Prefetch accounts using rayon's current thread pool context.
+    /// Use this when already executing on a rayon thread pool (e.g., from spawn_fifo).
+    pub fn prefetch_accounts_inline(&self, pubkeys: &[Pubkey]) {
+        use rayon::prelude::*;
+
+        if pubkeys.is_empty() {
+            return;
+        }
+
+        let ancestors = &self.ancestors;
+        let accounts = &self.rc.accounts;
+
+        pubkeys.par_iter().for_each(|pubkey| {
+            // Load the account - this populates the read cache
+            let _ = accounts.load_with_fixed_root(ancestors, pubkey);
+        });
+    }
+
+    /// Prefetch accounts asynchronously by spawning a background task.
+    /// Returns a handle that can be used to wait for completion.
+    /// This allows prefetching to happen in parallel with other work.
+    pub fn spawn_prefetch_accounts(
+        self: &Arc<Self>,
+        pubkeys: Vec<Pubkey>,
+        thread_pool: Arc<rayon::ThreadPool>,
+    ) -> std::thread::JoinHandle<()> {
+        let bank = Arc::clone(self);
+        std::thread::spawn(move || {
+            bank.prefetch_accounts(&pubkeys, &thread_pool);
+        })
     }
 
     pub fn get_program_accounts(
@@ -5010,7 +5097,7 @@ impl Bank {
             if tx.message.instructions().len()
                 > solana_transaction_context::MAX_INSTRUCTION_TRACE_LENGTH
             {
-                return Err(solana_transaction_error::TransactionError::SanitizeFailure);
+                return Err(TransactionError::SanitizeFailure);
             }
 
             let message_hash = if verification_mode == TransactionVerificationMode::FullVerification
@@ -5031,6 +5118,23 @@ impl Bank {
         }?;
 
         Ok(sanitized_tx)
+    }
+
+    pub fn fully_verify_transaction(
+        &self,
+        tx: VersionedTransaction,
+    ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
+        self.verify_transaction(tx, TransactionVerificationMode::FullVerification)
+    }
+
+    /// Simple transaction verification with minimal processing.
+    /// Skips compute budget instruction metadata extraction.
+    /// WARNING: This is unsafe and should only be used when safety is not a concern.
+    pub fn verify_transaction_simple(
+        &self,
+        tx: VersionedTransaction,
+    ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
+        RuntimeTransaction::try_create_simple(tx, self, self.get_reserved_account_keys())
     }
 
     /// Checks if the transaction violates the bank's reserved keys.
@@ -5197,6 +5301,10 @@ impl Bank {
         self.block_height
     }
 
+    pub fn max_processing_age(&self) -> usize {
+        MAX_PROCESSING_AGE
+    }
+
     /// Return the number of slots per epoch for the given epoch
     pub fn get_slots_in_epoch(&self, epoch: Epoch) -> u64 {
         self.epoch_schedule().get_slots_in_epoch(epoch)
@@ -5233,6 +5341,13 @@ impl Bank {
                 let num_account_keys = tx.account_keys().len();
                 let loaded_tx = &executed_tx.loaded_transaction;
                 loaded_tx.accounts.iter().take(num_account_keys)
+            })
+            // Early filter: only process accounts owned by vote or stake programs.
+            // check_and_store() does nothing for other account types, so this
+            // avoids the function call overhead for the majority of accounts.
+            .filter(|(_, account)| {
+                let owner = account.owner();
+                solana_vote_program::check_id(owner) || stake_program::check_id(owner)
             })
             .for_each(|(pubkey, account)| {
                 // note that this could get timed to: self.rc.accounts.accounts_db.stats.stakes_cache_check_and_store_us,
@@ -5406,7 +5521,11 @@ impl Bank {
         !self.is_delta.load(Relaxed)
     }
 
-    pub fn add_mockup_builtin(&mut self, program_id: Pubkey, builtin: BuiltinFunctionRegisterer) {
+    pub fn add_mockup_builtin(
+        &mut self,
+        program_id: Pubkey,
+        builtin: BuiltinFunctionRegisterer,
+    ) {
         self.add_builtin(
             program_id,
             "mockup",
@@ -5477,13 +5596,15 @@ impl Bank {
 
     pub fn deactivate_feature(&mut self, id: &Pubkey) {
         let mut feature_set = Arc::make_mut(&mut self.feature_set).clone();
-        feature_set.deactivate(id);
+        feature_set.active_mut().remove(id);
+        feature_set.inactive_mut().insert(*id);
         self.feature_set = Arc::new(feature_set);
     }
 
     pub fn activate_feature(&mut self, id: &Pubkey) {
         let mut feature_set = Arc::make_mut(&mut self.feature_set).clone();
-        feature_set.activate(id, 0);
+        feature_set.inactive_mut().remove(id);
+        feature_set.active_mut().insert(*id, 0);
         self.feature_set = Arc::new(feature_set);
     }
 
@@ -6298,10 +6419,10 @@ impl Bank {
     ) -> Option<Arc<ProgramCacheEntry>> {
         let environments = self
             .transaction_processor
-            .program_runtime_environment_for_epoch(effective_epoch);
+            .get_environments_for_epoch(effective_epoch);
         load_program_with_pubkey(
             self,
-            &environments,
+            &environments.program_runtime_v1,
             pubkey,
             self.slot(),
             &mut ExecuteTimings::default(), // Called by ledger-tool, metrics not accumulated.

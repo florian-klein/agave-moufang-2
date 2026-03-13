@@ -20,6 +20,7 @@ agave-xdp = { workspace = true }
 crossbeam-channel = { workspace = true }
 itertools = { workspace = true }
 lazy-lru = { workspace = true }
+libc = { workspace = true }
 log = { workspace = true }
 lru = { workspace = true }
 rand = { workspace = true }

@@ -26,8 +26,11 @@ use {
     scopeguard::defer,
     solana_clock::{Epoch, Slot},
     solana_cost_model::cost_model::CostModel,
-    solana_ledger::blockstore_processor::{
-        TransactionBatchWithIndexes, TransactionStatusSender, execute_batch,
+    solana_ledger::{
+        blockstore_processor::{
+            execute_batch, TransactionBatchWithIndexes, TransactionStatusSender,
+        },
+        dataset_tracking::TxExecutionSender,
     },
     solana_metrics::datapoint_info,
     solana_poh::transaction_recorder::{RecordTransactionsSummary, TransactionRecorder},
@@ -77,6 +80,13 @@ const MAX_UNIQUE_ACTIVE_TASK_COUNT: usize = 100_000;
 
 mod sleepless_testing;
 use crate::sleepless_testing::BuilderTracked;
+
+#[inline(always)]
+fn monotonic_micros() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) };
+    (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1_000
+}
 
 // dead_code is false positive; these tuple fields are used via Debug.
 #[allow(dead_code)]
@@ -257,6 +267,7 @@ pub struct HandlerContext {
     banking_packet_handler: Box<dyn BankingPacketHandler>,
     banking_stage_helper: Option<Arc<BankingStageHelper>>,
     transaction_recorder: Option<TransactionRecorder>,
+    tx_execution_sender: Option<Arc<TxExecutionSender>>,
 }
 
 impl HandlerContext {
@@ -296,6 +307,7 @@ struct CommonHandlerContext {
     transaction_status_sender: Option<TransactionStatusSender>,
     replay_vote_sender: Option<ReplayVoteSender>,
     prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
+    tx_execution_sender: Option<Arc<TxExecutionSender>>,
 }
 
 impl CommonHandlerContext {
@@ -312,6 +324,7 @@ impl CommonHandlerContext {
             transaction_status_sender,
             replay_vote_sender,
             prioritization_fee_cache,
+            tx_execution_sender,
         } = self;
 
         HandlerContext {
@@ -324,6 +337,7 @@ impl CommonHandlerContext {
             banking_packet_handler,
             banking_stage_helper,
             transaction_recorder,
+            tx_execution_sender,
         }
     }
 }
@@ -492,6 +506,7 @@ where
         transaction_status_sender: Option<TransactionStatusSender>,
         replay_vote_sender: Option<ReplayVoteSender>,
         prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
+        tx_execution_sender: Option<Arc<TxExecutionSender>>,
     ) -> Arc<Self> {
         Self::do_new(
             supported_scheduling_mode,
@@ -500,6 +515,7 @@ where
             transaction_status_sender,
             replay_vote_sender,
             prioritization_fee_cache,
+            tx_execution_sender,
             DEFAULT_POOL_CLEANER_INTERVAL,
             DEFAULT_MAX_POOLING_DURATION,
             DEFAULT_MAX_USAGE_QUEUE_COUNT,
@@ -522,6 +538,7 @@ where
             transaction_status_sender,
             replay_vote_sender,
             prioritization_fee_cache,
+            None,
         )
     }
 
@@ -540,6 +557,7 @@ where
             transaction_status_sender,
             replay_vote_sender,
             prioritization_fee_cache,
+            None,
         )
     }
 
@@ -551,6 +569,7 @@ where
         transaction_status_sender: Option<TransactionStatusSender>,
         replay_vote_sender: Option<ReplayVoteSender>,
         prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
+        tx_execution_sender: Option<Arc<TxExecutionSender>>,
         pool_cleaner_interval: Duration,
         max_pooling_duration: Duration,
         max_usage_queue_count: usize,
@@ -726,6 +745,7 @@ where
                 transaction_status_sender,
                 replay_vote_sender,
                 prioritization_fee_cache,
+                tx_execution_sender,
             },
             block_verification_handler_count,
             banking_stage_handler_context: Mutex::default(),
@@ -1152,8 +1172,9 @@ impl TaskHandler for DefaultTaskHandler {
         let batch = match scheduling_context.mode() {
             BlockVerification => {
                 // scheduler must properly prevent conflicting tx executions. thus, task handler isn't
-                // responsible for locking.
-                bank.prepare_unlocked_batch_from_single_tx(transaction)
+                // responsible for locking. Skip validate_account_locks since the transaction was
+                // already validated during sanitization.
+                bank.prepare_unlocked_batch_from_single_tx_unchecked(transaction)
             }
             BlockProduction => {
                 if let Err(error) = bank.resanitize_transaction_minimally(
@@ -1278,6 +1299,11 @@ impl TaskHandler for DefaultTaskHandler {
             }),
         };
 
+        let execution_start_us = handler_context
+            .tx_execution_sender
+            .as_ref()
+            .map(|_| monotonic_micros());
+
         *result = execute_batch(
             &batch_with_indexes,
             bank,
@@ -1295,6 +1321,20 @@ impl TaskHandler for DefaultTaskHandler {
             handler_context.prioritization_fee_cache.as_deref(),
             pre_commit_callback,
         );
+
+        if let (Some(sender), Some(start_us)) = (
+            handler_context.tx_execution_sender.as_ref(),
+            execution_start_us,
+        ) {
+            let end_us = monotonic_micros();
+            sender.record(
+                bank.slot(),
+                *transaction.signature(),
+                start_us,
+                end_us,
+            );
+        }
+
         sleepless_testing::at(CheckPoint::TaskHandled(task_id));
     }
 }
@@ -2931,7 +2971,7 @@ mod tests {
         super::*,
         crate::sleepless_testing,
         assert_matches::assert_matches,
-        solana_clock::Slot,
+        solana_clock::{MAX_PROCESSING_AGE, Slot},
         solana_hash::Hash,
         solana_keypair::Keypair,
         solana_ledger::blockstore_processor::{TransactionStatusBatch, TransactionStatusMessage},
@@ -2983,6 +3023,7 @@ mod tests {
                 transaction_status_sender,
                 replay_vote_sender,
                 prioritization_fee_cache,
+                None,
                 pool_cleaner_interval,
                 max_pooling_duration,
                 max_usage_queue_count,
@@ -4110,6 +4151,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let (_banking_packet_sender, banking_packet_receiver) = crossbeam_channel::unbounded();
 
@@ -4544,7 +4586,7 @@ mod tests {
                 genesis_config.hash(),
             ));
         let mut bank = Bank::new_for_tests(&genesis_config);
-        for _ in 0..bank.max_processing_age() {
+        for _ in 0..MAX_PROCESSING_AGE {
             bank.fill_bank_with_ticks_for_tests();
             bank.freeze();
             let slot = bank.slot();
@@ -4650,6 +4692,7 @@ mod tests {
             banking_packet_handler: Box::new(|_, _| {}),
             banking_stage_helper: None,
             transaction_recorder: None,
+            tx_execution_sender: None,
         };
 
         let task = SchedulingStateMachine::create_task(tx, 0, &mut |_| {
@@ -4733,6 +4776,7 @@ mod tests {
             banking_packet_handler: Box::new(|_, _| {}),
             banking_stage_helper: None,
             transaction_recorder: Some(transaction_recorder),
+            tx_execution_sender: None,
         };
 
         let task = SchedulingStateMachine::create_task(tx.clone(), 0, &mut |_| {
@@ -5186,6 +5230,7 @@ mod tests {
         let pool = DefaultSchedulerPool::new(
             // Both block verification and production scheduler are needed for this test.
             SupportedSchedulingMode::Both,
+            None,
             None,
             None,
             None,

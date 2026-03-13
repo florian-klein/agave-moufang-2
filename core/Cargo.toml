@@ -73,6 +73,8 @@ min-max-heap = { workspace = true }
 num_cpus = { workspace = true }
 num_enum = { workspace = true }
 prio-graph = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
 qualifier_attr = { workspace = true }
 quinn = { workspace = true }
 rand = { workspace = true }
@@ -175,6 +177,8 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
 trees = { workspace = true }
 wincode = { workspace = true }
 

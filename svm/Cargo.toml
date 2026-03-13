@@ -41,6 +41,7 @@ svm-internal = ["dep:qualifier_attr"]
 
 [dependencies]
 ahash = { workspace = true }
+geyser_shm_plugin = { package = "plugin", path = "../ipc-streamer/plugin" }
 log = { workspace = true }
 percentage = { workspace = true }
 qualifier_attr = { workspace = true, optional = true }
@@ -69,6 +70,7 @@ solana-program-runtime = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-rent = { workspace = true }
 solana-sdk-ids = { workspace = true }
+smallvec = { workspace = true }
 solana-svm-callback = { workspace = true }
 solana-svm-feature-set = { workspace = true }
 solana-svm-log-collector = { workspace = true }

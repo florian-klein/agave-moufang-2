@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(git show:*)",
+      "Bash(git log:*)",
+      "Bash(git checkout:*)",
+      "Bash(grep:*)",
+      "Bash(cargo metadata:*)",
+      "Bash(jq:*)",
+      "Bash(cargo check:*)",
+      "Bash(RUSTFLAGS=\"-C target-cpu=native\" cargo check:*)",
+      "Bash(RUSTFLAGS=\"-C target-cpu=native\" cargo test:*)",
+      "Bash(cat:*)",
+      "Bash(cargo test:*)",
+      "Bash(ls:*)",
+      "Bash(cargo tree:*)",
+      "Bash(git stash:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

@@ -1,0 +1,19 @@
+[package]
+name = "shm_accounts_shared"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = {version = "1.23.2", features = ["derive"]}
+dashmap = "6.1.0"
+gxhash = "3.5.0"
+libc = {version = "0.2.175", features = ["extra_traits"]}
+likely_stable = "0.1.3"
+memmap2 = "0.9.8"
+nix = { version = "0.30.1", features = ["fs", "mman", "poll"] }
+solana-pubkey = "2.4.0"
+thiserror = "2.0.16"
+
+[features]
+debug-prints = []
+latency-tracing = []

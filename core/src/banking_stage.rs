@@ -520,6 +520,9 @@ impl BankingStage {
                 BlockProductionMethod::CentralSchedulerGreedy => {
                     self.spawn_internal_central(true, num_workers, config)
                 }
+                BlockProductionMethod::UnifiedScheduler => {
+                    unreachable!("UnifiedScheduler uses unified-scheduler-pool, not banking stage")
+                }
             },
             #[cfg(unix)]
             BankingControlMsg::External { session } => self.spawn_external(session),

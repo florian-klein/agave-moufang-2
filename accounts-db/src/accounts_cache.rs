@@ -91,6 +91,15 @@ impl SlotCache {
     }
 
     pub fn insert(&self, pubkey: &Pubkey, account: AccountSharedData) -> Arc<CachedAccount> {
+        // Inserting into a frozen slot should never happen. If it does, it indicates a race
+        // condition between transaction processing and cache flush. A frozen slot means all
+        // transactions have completed, so no new accounts should be stored. This assertion
+        // helps detect bugs where the caller violates this invariant.
+        assert!(
+            !self.is_frozen(),
+            "Attempted to insert into frozen slot cache. This indicates a race condition."
+        );
+
         let data_len = account.data().len() as u64;
         let item = Arc::new(CachedAccount {
             account,
@@ -220,16 +229,23 @@ impl AccountsCache {
         pubkey: &Pubkey,
         account: AccountSharedData,
     ) -> Arc<CachedAccount> {
-        let slot_cache = self.slot_cache(slot).unwrap_or_else(||
-            // DashMap entry.or_insert() returns a RefMut, essentially a write lock,
-            // which is dropped after this block ends, minimizing time held by the lock.
-            // However, we still want to persist the reference to the `SlotStores` behind
-            // the lock, hence we clone it out, (`SlotStores` is an Arc so is cheap to clone).
-            self
-                .cache
-                .entry(slot)
-                .or_insert_with(|| self.new_inner())
-                .clone());
+        // Use entry API to atomically get-or-create the SlotCache AND keep a reference
+        // that prevents removal. This fixes a race condition where:
+        // 1. slot_cache(slot) returns existing SlotCache
+        // 2. Another thread removes the SlotCache (during flush)
+        // 3. insert() succeeds on the orphaned SlotCache
+        // 4. Index is updated to point to cache
+        // 5. Load fails because SlotCache is no longer in the map
+        //
+        // By using entry().or_insert_with(), we either:
+        // - Get a reference to the existing entry with the entry lock held
+        // - Create a new entry
+        // The entry lock prevents concurrent removal during our insert.
+        let slot_cache = self
+            .cache
+            .entry(slot)
+            .or_insert_with(|| self.new_inner())
+            .clone();
 
         slot_cache.insert(pubkey, account)
     }

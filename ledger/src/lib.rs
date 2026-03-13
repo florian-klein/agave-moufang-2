@@ -1,7 +1,7 @@
 #![cfg(feature = "agave-unstable-api")]
 #![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 #![allow(clippy::arithmetic_side_effects)]
-#![recursion_limit = "2048"]
+#![recursion_limit = "4096"]
 
 pub mod bank_forks_utils;
 pub mod bigtable_delete;
@@ -19,6 +19,8 @@ pub mod blockstore_metric_report_service;
 pub mod blockstore_metrics;
 pub mod blockstore_options;
 pub mod blockstore_processor;
+pub mod dataset_tracking;
+pub mod entry_cache;
 pub mod entry_notifier_interface;
 pub mod entry_notifier_service;
 pub mod genesis_utils;
@@ -26,7 +28,12 @@ pub mod leader_schedule_cache;
 pub mod next_slots_iterator;
 pub mod rooted_slot_iterator;
 pub mod shred;
-mod shredder;
+
+pub mod fetch_stage_tracer;
+pub mod parquet_writer;
+pub mod shred_arrival_store;
+pub mod shredder;
+pub mod window_service_tracer;
 pub mod sigverify_shreds;
 pub mod slot_stats;
 mod staking_utils;

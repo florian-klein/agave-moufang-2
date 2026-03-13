@@ -30,7 +30,7 @@ use {
     solana_send_transaction_service::send_transaction_service::Config as SendTransactionServiceConfig,
     solana_signer::Signer,
     solana_unified_scheduler_pool::DefaultSchedulerPool,
-    std::{collections::HashSet, net::SocketAddr, path::PathBuf, str::FromStr},
+    std::{collections::HashSet, net::{IpAddr, SocketAddr}, path::PathBuf, str::FromStr},
 };
 
 const EXCLUDE_KEY: &str = "account-index-exclude-key";
@@ -51,6 +51,7 @@ pub struct RunArgs {
     pub logfile: Option<PathBuf>,
     pub entrypoints: Vec<SocketAddr>,
     pub known_validators: Option<HashSet<Pubkey>>,
+    pub trusted_shred_publishers: Option<HashSet<IpAddr>>,
     pub socket_addr_space: SocketAddrSpace,
     pub rpc_bootstrap_config: RpcBootstrapConfig,
     pub blockstore_options: BlockstoreOptions,
@@ -114,6 +115,15 @@ impl FromClapArgMatches for RunArgs {
             "known validator",
         )?;
 
+        let trusted_shred_publishers = if matches.is_present("trusted_shred_publishers") {
+            let publishers: Option<HashSet<IpAddr>> = values_t!(matches, "trusted_shred_publishers", IpAddr)
+                .ok()
+                .map(|publishers| publishers.into_iter().collect());
+            publishers
+        } else {
+            None
+        };
+
         let socket_addr_space = SocketAddrSpace::new(matches.is_present("allow_private_addr"));
 
         Ok(RunArgs {
@@ -122,6 +132,7 @@ impl FromClapArgMatches for RunArgs {
             logfile,
             entrypoints,
             known_validators,
+            trusted_shred_publishers,
             socket_addr_space,
             rpc_bootstrap_config: RpcBootstrapConfig::from_clap_arg_match(matches)?,
             blockstore_options: BlockstoreOptions::from_clap_arg_match(matches)?,
@@ -541,6 +552,65 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Skip ledger verification at validator bootup."),
     )
     .arg(
+        Arg::with_name("deferred_signature_verification")
+            .long("deferred-signature-verification")
+            .takes_value(false)
+            .help(
+                "Execute transactions before signature verification completes. \
+                 Reduces latency for ShmPlugin notifications by 10-100ms. \
+                 WARNING: This is experimental and may execute invalid transactions."
+            ),
+    )
+    .arg(
+        Arg::with_name("deferred_poh_verification")
+            .long("deferred-poh-verification")
+            .takes_value(false)
+            .help(
+                "Execute transactions before PoH verification completes. \
+                 Reduces latency for ShmPlugin notifications by 1-10ms. \
+                 WARNING: This is experimental and may execute invalid transactions."
+            ),
+    )
+    .arg(
+        Arg::with_name("prefetch_accounts")
+            .long("prefetch-accounts")
+            .takes_value(false)
+            .help(
+                "Prefetch accounts into the read cache in background while \
+                 verification runs. This can reduce transaction execution latency \
+                 by warming the cache ahead of time."
+            ),
+    )
+    .arg(
+        Arg::with_name("no_entry_cache")
+            .long("no-entry-cache")
+            .takes_value(false)
+            .help(
+                "Disable entry cache for replay. By default, entries are read from \
+                 an in-memory cache first, falling back to blockstore. This reduces \
+                 replay latency by 100-500us per entry batch. Use this flag to disable \
+                 caching if you experience issues."
+            ),
+    )
+    .arg(
+        Arg::with_name("enable_shred_arrival_tracing")
+            .long("enable-shred-arrival-tracing")
+            .takes_value(false)
+            .help(
+                "Enable per-shred arrival tracing to CSV files. When enabled, arrival \
+                 metadata (timestamp, source IP, source type) is captured for each shred \
+                 and written to CSV files when completed data sets are produced."
+            ),
+    )
+    .arg(
+        Arg::with_name("shred_arrival_output_dir")
+            .long("shred-arrival-output-dir")
+            .takes_value(true)
+            .value_name("DIR")
+            .default_value("shred_arrivals")
+            .help("Output directory for shred arrival CSV data [default: shred_arrivals]"),
+    )
+    .arg(
         clap::Arg::with_name("require_tower")
             .long("require-tower")
             .takes_value(false)
@@ -672,6 +742,27 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                 "A list of validators to gossip with. If specified, gossip will not push/pull \
                  from from validators outside this set. [default: all validators]",
             ),
+    )
+    .arg(
+        Arg::with_name("trusted_shred_publishers")
+            .long("trusted-shred-publisher")
+            .validator(solana_net_utils::is_host)
+            .value_name("IP ADDRESS")
+            .multiple(true)
+            .takes_value(true)
+            .help(
+                "A list of IP addresses for trusted shred publishers. Shreds from these addresses \
+                 will skip signature verification. [default: none]",
+            ),
+    )
+    .arg(
+        Arg::with_name("tpu_connection_pool_size")
+            .long("tpu-connection-pool-size")
+            .takes_value(true)
+            .default_value("4")
+            .hidden(hidden_unless_forced())
+            .validator(is_parsable::<usize>)
+            .help("[DEPRECATED] Controls the TPU connection pool size per remote address"),
     )
     .arg(
         Arg::with_name("tpu_max_connections_per_ipaddr_per_minute")
@@ -1242,6 +1333,46 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .requires("retransmit_xdp_cpu_cores")
             .help("EXPERIMENTAL: Enable XDP zero copy. Requires hardware support"),
     )
+    // Jito Shredstream arguments
+    .arg(
+        Arg::with_name("shredstream_enable")
+            .long("shredstream-enable")
+            .takes_value(false)
+            .help("Enable Jito shredstream integration to receive shreds directly from Jito's block engine"),
+    )
+    .arg(
+        Arg::with_name("shredstream_block_engine_url")
+            .long("shredstream-block-engine-url")
+            .takes_value(true)
+            .value_name("URL")
+            .requires("shredstream_enable")
+            .help("Jito block engine URL (e.g., https://mainnet.block-engine.jito.wtf)"),
+    )
+    .arg(
+        Arg::with_name("shredstream_auth_keypair")
+            .long("shredstream-auth-keypair")
+            .takes_value(true)
+            .value_name("KEYPAIR")
+            .requires("shredstream_enable")
+            .help("Path to keypair for Jito authentication [default: validator identity]"),
+    )
+    .arg(
+        Arg::with_name("shredstream_regions")
+            .long("shredstream-regions")
+            .takes_value(true)
+            .value_name("REGIONS")
+            .requires("shredstream_enable")
+            .help("Comma-separated regions to receive shreds from: amsterdam,frankfurt,ny,tokyo"),
+    )
+    .arg(
+        Arg::with_name("shredstream_public_ip")
+            .long("shredstream-public-ip")
+            .takes_value(true)
+            .value_name("IP")
+            .validator(solana_net_utils::is_host)
+            .requires("shredstream_enable")
+            .help("Public IP address for shredstream registration [default: auto-detect from gossip]"),
+    )
     .args(&pub_sub_config::args(/*test_validator:*/ false))
     .args(&json_rpc_config::args())
     .args(&rpc_bigtable_config::args())
@@ -1296,6 +1427,7 @@ mod tests {
                 PathBuf::from(format!("agave-validator-{}.log", identity_keypair.pubkey()));
             let entrypoints = vec![];
             let known_validators = None;
+            let trusted_shred_publishers = None;
 
             let json_rpc_config =
                 crate::commands::run::args::json_rpc_config::tests::default_json_rpc_config();
@@ -1306,6 +1438,7 @@ mod tests {
                 logfile: Some(logfile),
                 entrypoints,
                 known_validators,
+                trusted_shred_publishers,
                 socket_addr_space: SocketAddrSpace::Global,
                 rpc_bootstrap_config: RpcBootstrapConfig::default(),
                 blockstore_options: BlockstoreOptions::default(),
@@ -1329,6 +1462,7 @@ mod tests {
                 logfile: self.logfile.clone(),
                 entrypoints: self.entrypoints.clone(),
                 known_validators: self.known_validators.clone(),
+                trusted_shred_publishers: self.trusted_shred_publishers.clone(),
                 socket_addr_space: self.socket_addr_space,
                 ledger_path: self.ledger_path.clone(),
                 rpc_bootstrap_config: self.rpc_bootstrap_config.clone(),

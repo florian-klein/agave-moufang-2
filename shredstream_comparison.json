@@ -1,0 +1,246 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "panels": [],
+      "title": "ShredStream Impact Analysis",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisLabel": "Percentage",
+            "drawStyle": "line",
+            "fillOpacity": 30,
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": { "mode": "normal" }
+          },
+          "mappings": [],
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "from_root" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "from_layer1" }, "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "from_layer2" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "from_layer3" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "id": 1,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi" } },
+      "title": "Turbine Layer Distribution (KEY METRIC)",
+      "description": "Shows which turbine layer shreds are received from. With ShredStream, expect more green (root) and blue (layer1).",
+      "type": "timeseries",
+      "targets": [
+        {
+          "query": "SELECT (mean(\"num_shreds_received_from_root\") / (mean(\"num_shreds_received_from_root\") + mean(\"num_shreds_received_from_layer1\") + mean(\"num_shreds_received_from_layer2\") + mean(\"num_shreds_received_from_layer3\") + 0.001)) * 100 as \"from_root\", (mean(\"num_shreds_received_from_layer1\") / (mean(\"num_shreds_received_from_root\") + mean(\"num_shreds_received_from_layer1\") + mean(\"num_shreds_received_from_layer2\") + mean(\"num_shreds_received_from_layer3\") + 0.001)) * 100 as \"from_layer1\", (mean(\"num_shreds_received_from_layer2\") / (mean(\"num_shreds_received_from_root\") + mean(\"num_shreds_received_from_layer1\") + mean(\"num_shreds_received_from_layer2\") + mean(\"num_shreds_received_from_layer3\") + 0.001)) * 100 as \"from_layer2\", (mean(\"num_shreds_received_from_layer3\") / (mean(\"num_shreds_received_from_root\") + mean(\"num_shreds_received_from_layer1\") + mean(\"num_shreds_received_from_layer2\") + mean(\"num_shreds_received_from_layer3\") + 0.001)) * 100 as \"from_layer3\" FROM \"retransmit-stage-slot-stats\" WHERE $timeFilter GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisLabel": "ms", "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 },
+          "mappings": [],
+          "unit": "ms",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 300 }, { "color": "red", "value": 400 }] }
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "id": 2,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi" } },
+      "title": "Slot Duration (First to Last Shred)",
+      "description": "Time between first and last shred received for each slot. Lower is better. Target: <300ms",
+      "type": "timeseries",
+      "targets": [
+        {
+          "query": "SELECT mean(\"slot_duration_ms\") as \"slot_duration\" FROM \"retransmit-stage-slot-stats\" WHERE $timeFilter GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 10 }, { "color": "green", "value": 30 }] },
+          "unit": "percent"
+        }
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 9 },
+      "id": 3,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "% from Root/Layer1 (Goal: Higher)",
+      "description": "Percentage of shreds from root or layer 1. Higher = better latency. With ShredStream this should increase significantly.",
+      "type": "stat",
+      "targets": [
+        {
+          "query": "SELECT ((last(\"num_shreds_received_from_root\") + last(\"num_shreds_received_from_layer1\")) / (last(\"num_shreds_received_from_root\") + last(\"num_shreds_received_from_layer1\") + last(\"num_shreds_received_from_layer2\") + last(\"num_shreds_received_from_layer3\") + 0.001)) * 100 FROM \"retransmit-stage-slot-stats\" WHERE $timeFilter",
+          "rawQuery": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 300 }, { "color": "red", "value": 400 }] },
+          "unit": "ms"
+        }
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 9 },
+      "id": 4,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["mean"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Avg Slot Duration (Goal: <300ms)",
+      "description": "Average time to receive all shreds for a slot. Lower = faster block reception.",
+      "type": "stat",
+      "targets": [
+        {
+          "query": "SELECT mean(\"slot_duration_ms\") FROM \"retransmit-stage-slot-stats\" WHERE $timeFilter",
+          "rawQuery": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 10 }] },
+          "unit": "percent"
+        }
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 9 },
+      "id": 5,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["mean"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "FEC Recovery Rate (Goal: <5%)",
+      "description": "Percentage of shreds recovered via FEC. Lower = better network reception, less reliance on error correction.",
+      "type": "stat",
+      "targets": [
+        {
+          "query": "SELECT (mean(\"num_recovered\") / (mean(\"num_data_shreds\") + mean(\"num_recovered\") + 0.001)) * 100 FROM \"blockstore-insert-shreds\" WHERE $timeFilter",
+          "rawQuery": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 50 }, { "color": "red", "value": 100 }] },
+          "unit": "ms"
+        }
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 9 },
+      "id": 6,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["mean"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Blockstore Insert Time (Goal: <50ms)",
+      "description": "Time to insert shreds into blockstore. Lower = faster processing.",
+      "type": "stat",
+      "targets": [
+        {
+          "query": "SELECT mean(\"insert_shreds_us\") / 1000 FROM \"blockstore-insert-shreds\" WHERE $timeFilter",
+          "rawQuery": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "id": 101,
+      "panels": [],
+      "title": "Raw Shred Counts by Layer",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisLabel": "shreds", "drawStyle": "bars", "fillOpacity": 80, "lineWidth": 1, "stacking": { "mode": "normal" } },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "root" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "layer1" }, "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "layer2" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "layer3" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 15 },
+      "id": 7,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi" } },
+      "title": "Shreds Received by Layer (Stacked)",
+      "description": "Raw count of shreds by turbine layer. Green (root) and blue (layer1) = low latency path.",
+      "type": "timeseries",
+      "targets": [
+        {
+          "query": "SELECT mean(\"num_shreds_received_from_root\") as \"root\", mean(\"num_shreds_received_from_layer1\") as \"layer1\", mean(\"num_shreds_received_from_layer2\") as \"layer2\", mean(\"num_shreds_received_from_layer3\") as \"layer3\" FROM \"retransmit-stage-slot-stats\" WHERE $timeFilter GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "id": 102,
+      "panels": [],
+      "title": "Before/After Comparison Guide",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 24 },
+      "id": 8,
+      "options": {
+        "content": "## How to Use This Dashboard\n\n### Before Enabling ShredStream\n1. Note your current values for the 4 stat panels above\n2. Screenshot or record: % from Root/Layer1, Avg Slot Duration, FEC Recovery Rate, Blockstore Insert Time\n\n### After Enabling ShredStream\nExpected improvements:\n| Metric | Before (typical non-staked) | After (with ShredStream) |\n|--------|---------------------------|-------------------------|\n| % from Root/Layer1 | 0-5% | 30-70%+ |\n| Avg Slot Duration | 300-400ms | 200-300ms |\n| FEC Recovery Rate | 5-15% | 2-8% |\n\n### Key Indicators of Success\n- **Green/Blue bars growing** in the stacked chart = more shreds from faster paths\n- **Slot duration decreasing** = receiving complete blocks faster\n- **Layer distribution shifting left** = better turbine position equivalent\n\n### Note\nShredStream essentially gives you \"virtual Layer 1\" access by receiving shreds directly from Jito's infrastructure, bypassing normal turbine propagation delays.",
+        "mode": "markdown"
+      },
+      "title": "Comparison Guide",
+      "type": "text"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["solana", "shredstream", "latency"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "ShredStream Impact Analysis",
+  "version": 1,
+  "weekStart": ""
+}

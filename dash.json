@@ -1,0 +1,1235 @@
+{
+    "annotations": {
+      "list": []
+    },
+    "editable": true,
+    "fiscalYearStartMonth": 0,
+    "graphTooltip": 0,
+    "id": null,
+    "links": [],
+    "liveNow": false,
+    "panels": [
+      {
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+        "id": 100,
+        "panels": [],
+        "title": "📊 Shred Reception Overview",
+        "type": "row"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 6, "w": 6, "x": 0, "y": 1 },
+        "id": 1,
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "orientation": "auto",
+          "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+          "textMode": "auto"
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT last(\"shred_count\") FROM \"shred_fetch\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Total Shreds Received",
+        "type": "stat"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 1000 }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 6, "w": 6, "x": 6, "y": 1 },
+        "id": 2,
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "orientation": "auto",
+          "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+          "textMode": "auto"
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT last(\"overflow_shreds\") FROM \"shred_fetch\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Overflow Shreds (Dropped)",
+        "type": "stat"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 6, "w": 6, "x": 12, "y": 1 },
+        "id": 3,
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "orientation": "auto",
+          "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+          "textMode": "auto"
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT last(\"num_shreds\") FROM \"retransmit-stage\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Shreds Retransmitted",
+        "type": "stat"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 500 }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 6, "w": 6, "x": 18, "y": 1 },
+        "id": 4,
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "orientation": "auto",
+          "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+          "textMode": "auto"
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT last(\"num_duplicates\") FROM \"shred_sigverify\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Duplicate Shreds",
+        "type": "stat"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+        "id": 5,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT derivative(\"shred_count\", 1s) AS \"shreds/sec\" FROM \"shred_fetch\" WHERE $timeFilter GROUP BY time($__interval) fill(null)",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Shred Reception Rate (shreds/sec)",
+        "type": "timeseries"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+        "id": 6,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"num_shreds_received\" FROM \"window_service\" WHERE $timeFilter GROUP BY time($__interval) fill(null)",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Window Service - Shreds Received",
+        "type": "timeseries"
+      },
+      {
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+        "id": 101,
+        "panels": [],
+        "title": "🔄 Retransmit Stage",
+        "type": "row"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "normal" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+        "id": 7,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"num_shreds_received_root\" AS \"root\", \"num_shreds_received_1st_layer\" AS \"1st_layer\", \"num_shreds_received_2nd_layer\" AS \"2nd_layer\", \"num_shreds_received_3rd_layer\" AS \"3rd_layer\" FROM \"retransmit-stage-slot-stats\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Shreds Received by Turbine Layer",
+        "type": "timeseries"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+            "unit": "ms"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+        "id": 8,
+        "options": {
+          "legend": { "calcs": ["mean", "max", "min"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"elapsed_millis\" FROM \"retransmit-stage-slot-stats\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Slot Shred Reception Duration (first to last shred)",
+        "type": "timeseries"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+        "id": 9,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"num_shreds\" AS \"processed\", \"num_shreds_skipped\" AS \"skipped\" FROM \"retransmit-stage\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Retransmit Stage - Shreds Processed vs Skipped",
+        "type": "timeseries"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+            "unit": "µs"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+        "id": 10,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"total_time\", \"retransmit_total\", \"compute_turbine\" FROM \"retransmit-stage\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Retransmit Stage Timing (µs)",
+        "type": "timeseries"
+      },
+      {
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+        "id": 102,
+        "panels": [],
+        "title": "✅ Signature Verification",
+        "type": "row"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 33 },
+        "id": 11,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"num_packets\", \"num_retransmit_shreds\" FROM \"shred_sigverify\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Sigverify - Packets Received vs Retransmit Shreds",
+        "type": "timeseries"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 80 }] },
+            "unit": "short"
+          },
+          "overrides": [
+            { "matcher": { "id": "byName", "options": "discards_pre" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
+            { "matcher": { "id": "byName", "options": "discards_post" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
+            { "matcher": { "id": "byName", "options": "duplicates" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] }
+          ]
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 33 },
+        "id": 12,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"num_discards_pre\" AS \"discards_pre\", \"num_discards_post\" AS \"discards_post\", \"num_duplicates\" AS \"duplicates\" FROM \"shred_sigverify\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Sigverify - Discards & Duplicates",
+        "type": "timeseries"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+            "unit": "µs"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+        "id": 13,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"elapsed_micros\", \"resign_micros\" FROM \"shred_sigverify\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Sigverify Timing (µs)",
+        "type": "timeseries"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 80 }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+        "id": 14,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"num_unknown_slot_leader\", \"num_unknown_turbine_parent\", \"num_invalid_retransmitter\" FROM \"shred_sigverify\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Sigverify - Unknown/Invalid Counts",
+        "type": "timeseries"
+      },
+      {
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 49 },
+        "id": 103,
+        "panels": [],
+        "title": "⚠️ Shred Fetch Errors",
+        "type": "row"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 80 }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 50 },
+        "id": 15,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"shred_version_mismatch\", \"bad_shred_type\", \"bad_parent_offset\" FROM \"shred_fetch\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Shred Fetch - Version/Type Errors",
+        "type": "timeseries"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 80 }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 50 },
+        "id": 16,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"index_overrun\", \"index_bad_deserialize\", \"index_out_of_bounds\", \"slot_bad_deserialize\", \"slot_out_of_range\" FROM \"shred_fetch\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Shred Fetch - Index/Slot Errors",
+        "type": "timeseries"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 80 }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 58 },
+        "id": 17,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"fec_set_index_bad_deserialize\", \"misaligned_fec_set_size\", \"erasure_config_bad_deserialize\", \"misaligned_erasure_config\" FROM \"shred_fetch\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Shred Fetch - FEC/Erasure Errors",
+        "type": "timeseries"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 58 },
+        "id": 18,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"num_shreds_merkle_code_chained\", \"num_shreds_merkle_data_chained\" FROM \"shred_fetch\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Shred Fetch - Merkle Shreds (Chained)",
+        "type": "timeseries"
+      },
+      {
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 66 },
+        "id": 104,
+        "panels": [],
+        "title": "💾 Blockstore Insertion",
+        "type": "row"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 67 },
+        "id": 19,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"num_shreds\", \"num_inserted\", \"num_recovered\" FROM \"shred_insert\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Blockstore - Shreds Inserted & Recovered",
+        "type": "timeseries"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+            "unit": "µs"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 67 },
+        "id": 20,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"total_elapsed_us\", \"insert_shreds_elapsed_us\", \"shred_recovery_elapsed_us\", \"write_batch_elapsed_us\" FROM \"shred_insert\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Blockstore - Insertion Timing (µs)",
+        "type": "timeseries"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 75 },
+        "id": 21,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"num_turbine_data_shreds_exists\", \"num_repaired_data_shreds_exists\", \"num_coding_shreds_exists\" FROM \"shred_insert\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Blockstore - Already Existing Shreds",
+        "type": "timeseries"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 80 }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 75 },
+        "id": 22,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"num_data_shreds_invalid\", \"num_coding_shreds_invalid\", \"num_coding_shreds_invalid_erasure_config\", \"num_data_shreds_blockstore_error\" FROM \"shred_insert\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Blockstore - Invalid Shreds & Errors",
+        "type": "timeseries"
+      },
+      {
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 83 },
+        "id": 105,
+        "panels": [],
+        "title": "🌐 Cluster Nodes",
+        "type": "row"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 84 },
+        "id": 23,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"num_nodes\", \"num_nodes_staked\", \"num_nodes_dead\", \"num_nodes_stale\" FROM \"cluster_nodes_retransmit\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Cluster Nodes - Count",
+        "type": "timeseries"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "auto",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 84 },
+        "id": 24,
+        "options": {
+          "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "multi", "sort": "desc" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"epoch_stakes\", \"stake_dead\", \"stake_stale\" FROM \"cluster_nodes_retransmit\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Cluster Nodes - Stake (SOL)",
+        "type": "timeseries"
+      },
+      {
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 92 },
+        "id": 106,
+        "panels": [],
+        "title": "🕐 First Shred Timing",
+        "type": "row"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "points",
+              "fillOpacity": 0,
+              "gradientMode": "none",
+              "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": { "type": "linear" },
+              "showPoints": "always",
+              "spanNulls": false,
+              "stacking": { "group": "A", "mode": "none" },
+              "thresholdsStyle": { "mode": "off" }
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 8, "w": 24, "x": 0, "y": 93 },
+        "id": 25,
+        "options": {
+          "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+          "tooltip": { "mode": "single", "sort": "none" }
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"slot\" FROM \"retransmit-first-shred\" WHERE $timeFilter",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "First Shred Received (by slot)",
+        "type": "timeseries"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "local-influxdb" },
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "thresholds" },
+            "custom": {
+              "align": "auto",
+              "displayMode": "auto",
+              "inspect": false
+            },
+            "mappings": [],
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+          },
+          "overrides": []
+        },
+        "gridPos": { "h": 10, "w": 24, "x": 0, "y": 101 },
+        "id": 26,
+        "options": {
+          "footer": { "fields": "", "reducer": ["sum"], "show": false },
+          "showHeader": true,
+          "sortBy": [{ "desc": true, "displayName": "time" }]
+        },
+        "pluginVersion": "9.0.0",
+        "targets": [
+          {
+            "query": "SELECT \"slot\", \"num_shreds\", \"elapsed_millis\", \"num_shreds_received_root\", \"num_shreds_received_1st_layer\", \"num_shreds_received_2nd_layer\", \"num_shreds_received_3rd_layer\" FROM \"retransmit-stage-slot-stats\" WHERE $timeFilter ORDER BY time DESC LIMIT 50",
+            "rawQuery": true,
+            "refId": "A"
+          }
+        ],
+        "title": "Recent Slot Stats (last 50)",
+        "type": "table"
+      }
+    ],
+    "refresh": "5s",
+    "schemaVersion": 38,
+    "style": "dark",
+    "tags": ["solana", "shred", "turbine"],
+    "templating": {
+      "list": []
+    },
+    "time": { "from": "now-15m", "to": "now" },
+    "timepicker": {},
+    "timezone": "",
+    "title": "Solana Shred Monitoring",
+    "uid": "solana-shred-monitoring",
+    "version": 1,
+    "weekStart": ""
+  }

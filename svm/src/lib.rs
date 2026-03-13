@@ -18,6 +18,10 @@ pub mod transaction_processing_callback;
 pub mod transaction_processing_result;
 pub mod transaction_processor;
 
+// Re-export ShmPlugin and accessor for sysvar notifications
+pub use geyser_shm_plugin::ShmPlugin;
+pub use transaction_processor::global_shm_plugin;
+
 #[cfg_attr(feature = "frozen-abi", macro_use)]
 #[cfg(feature = "frozen-abi")]
 extern crate solana_frozen_abi_macro;

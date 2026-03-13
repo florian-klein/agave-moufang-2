@@ -28,6 +28,7 @@ use {
         blockstore_processor::{
             self, BlockstoreProcessorError, ProcessOptions, TransactionStatusSender,
         },
+        dataset_tracking::{TxExecutionCsvWriter, TxExecutionSender},
         leader_schedule_cache::LeaderScheduleCache,
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
     },
@@ -385,6 +386,15 @@ pub fn load_and_process_ledger(
         "block_production_method",
         BlockProductionMethod
     )
+    .inspect(|method| {
+        if matches!(method, BlockProductionMethod::UnifiedScheduler) {
+            warn!(
+                "Currently, the unified-scheduler method is experimental for block-production. It \
+                 has known security issues and should be used only for developing and \
+                 benchmarking purposes"
+            );
+        }
+    })
     .unwrap_or_default();
     info!(
         "Using: block-verification-method: {block_verification_method}, block-production-method: \
@@ -392,6 +402,17 @@ pub fn load_and_process_ledger(
     );
     let unified_scheduler_handler_threads =
         value_t!(arg_matches, "unified_scheduler_handler_threads", usize).ok();
+    // Set up TX execution tracing for benchmarking.
+    // Output goes to <ledger>/tx_bench/ so bench_track.py can pick it up.
+    let tx_bench_output_dir = blockstore.ledger_path().join("tx_bench");
+    let (tx_execution_sender, _tx_execution_writer) = {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let sender = Arc::new(TxExecutionSender::new(tx));
+        let writer = TxExecutionCsvWriter::spawn_writer(tx_bench_output_dir.clone(), rx);
+        (Some(sender), Some(writer))
+    };
+    info!("TX execution tracing enabled, output: {:?}", tx_bench_output_dir);
+
     let unified_scheduler_pool = match (&block_verification_method, &block_production_method) {
         methods @ (BlockVerificationMethod::UnifiedScheduler, _) => {
             let no_replay_vote_sender = None;
@@ -403,6 +424,7 @@ pub fn load_and_process_ledger(
                 transaction_status_sender.clone(),
                 no_replay_vote_sender,
                 None,
+                tx_execution_sender,
             );
             bank_forks
                 .write()

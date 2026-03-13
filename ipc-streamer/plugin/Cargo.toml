@@ -1,0 +1,25 @@
+[package]
+name = "plugin"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "geyser_shm_plugin"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+shm_accounts_shared = { path = "../shared" }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+agave-geyser-plugin-interface = "3.0.1"
+serde_json = "1.0.143"
+solana-pubkey = "3.0.0"
+arc-swap = "1.7.1"
+dashmap = "6.1.0"
+gxhash = "3.5.0"
+libc = "0.2"
+crossbeam = "0.8.4"
+crossbeam-queue = { version = "0.3.12", features = ["nightly"] }
+solana-transaction = "3.0.1"
+fastbloom = "0.14.0"

@@ -29,6 +29,10 @@ use {
                 AncestorDuplicateSlotsReceiver, DumpedSlotsSender, PopularPrunedForksReceiver,
             },
         },
+        slot_latency_tracker::{
+            LatencyEvent, LatencyEventReceiver, LatencyEventSender, SlotLatencyAggregator,
+            WakeupSource,
+        },
         unfrozen_gossip_verified_vote_hashes::UnfrozenGossipVerifiedVoteHashes,
         voting_service::VoteOp,
         window_service::DuplicateSlotReceiver,
@@ -45,8 +49,8 @@ use {
         migration::{GENESIS_VOTE_REFRESH, MigrationStatus},
         vote::Vote,
     },
-    crossbeam_channel::{Receiver, RecvTimeoutError, Sender},
-    rayon::{ThreadPool, prelude::*},
+    crossbeam_channel::{select, Receiver, RecvTimeoutError, Sender},
+    rayon::{prelude::*, ThreadPool},
     solana_accounts_db::contains::Contains,
     solana_clock::{BankId, NUM_CONSECUTIVE_LEADER_SLOTS, Slot},
     solana_geyser_plugin_manager::block_metadata_notifier_interface::BlockMetadataNotifierArc,
@@ -284,6 +288,31 @@ pub struct ReplayStageConfig {
     pub prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
     pub banking_tracer: Arc<BankingTracer>,
     pub snapshot_controller: Option<Arc<SnapshotController>>,
+    /// When true, execute transactions before signature verification completes.
+    /// Signature verification runs asynchronously after execution, reducing
+    /// latency for ShmPlugin notifications by 10-100ms. Consensus safety is maintained.
+    pub deferred_signature_verification: bool,
+    /// When true, execute transactions before PoH verification completes.
+    /// PoH verification runs after execution, reducing latency for ShmPlugin notifications.
+    pub deferred_poh_verification: bool,
+    /// When true, prefetch accounts into the read cache in background while
+    /// verification runs, reducing latency for transaction execution.
+    pub prefetch_accounts: bool,
+    /// Optional entry cache for low-latency entry access during replay.
+    /// When provided, entries are read from cache first, falling back to blockstore.
+    pub entry_cache: Option<Arc<solana_ledger::entry_cache::EntryCache>>,
+    /// Optional sender for dataset execution timing CSV tracking.
+    pub dataset_execution_sender:
+        Option<Arc<solana_ledger::dataset_tracking::DatasetExecutionSender>>,
+    /// Optional sender for tick tracking CSV recording.
+    pub tick_tracking_sender: Option<Arc<solana_ledger::dataset_tracking::TickTrackingSender>>,
+    /// Optional sender for replay batch tracking CSV recording.
+    pub replay_batch_sender: Option<Arc<solana_ledger::dataset_tracking::ReplayBatchSender>>,
+    /// Optional sender for per-transaction execution timing CSV tracking.
+    pub tx_execution_sender: Option<Arc<solana_ledger::dataset_tracking::TxExecutionSender>>,
+    /// Optional sender for per-transaction cost/priority parquet tracking.
+    pub tx_cost_priority_sender:
+        Option<Arc<solana_ledger::dataset_tracking::TxCostPrioritySender>>,
     pub replay_highest_frozen: Arc<ReplayHighestFrozen>,
     pub migration_status: Arc<MigrationStatus>,
 }
@@ -316,6 +345,10 @@ pub struct ReplayReceivers {
     pub duplicate_confirmed_slots_receiver: Receiver<Vec<(u64, Hash)>>,
     pub gossip_verified_vote_hash_receiver: Receiver<(Pubkey, u64, Hash)>,
     pub popular_pruned_forks_receiver: Receiver<Vec<u64>>,
+    /// Sender for latency tracking events (cloned to record events)
+    pub latency_event_sender: Option<LatencyEventSender>,
+    /// Receiver for latency tracking events (owned by aggregator)
+    pub latency_event_receiver: Option<LatencyEventReceiver>,
 }
 
 /// Timing information for the ReplayStage main processing loop
@@ -351,6 +384,11 @@ struct ReplayLoopTiming {
     generate_new_bank_forks_write_lock_us: Saturating<u64>,
     // When processing multiple forks concurrently, only captures the longest fork
     replay_blockstore_us: u64,
+    // Granular metrics for replay_active_banks breakdown
+    execute_batches_us: u64,
+    process_results_us: u64,
+    wait_scheduler_us: u64,
+    freeze_bank_us: u64,
 }
 impl ReplayLoopTiming {
     #[allow(clippy::too_many_arguments)]
@@ -555,6 +593,11 @@ impl ReplayLoopTiming {
                     self.replay_blockstore_us as i64,
                     i64
                 ),
+                // Granular replay_active_banks breakdown
+                ("execute_batches_us", self.execute_batches_us as i64, i64),
+                ("process_results_us", self.process_results_us as i64, i64),
+                ("wait_scheduler_us", self.wait_scheduler_us as i64, i64),
+                ("freeze_bank_us", self.freeze_bank_us as i64, i64),
             );
             *self = ReplayLoopTiming::default();
             self.last_submit = now;
@@ -595,6 +638,15 @@ impl ReplayStage {
             prioritization_fee_cache,
             banking_tracer,
             snapshot_controller,
+            deferred_signature_verification,
+            deferred_poh_verification,
+            prefetch_accounts,
+            entry_cache,
+            dataset_execution_sender,
+            tx_execution_sender,
+            tx_cost_priority_sender,
+            tick_tracking_sender,
+            replay_batch_sender,
             replay_highest_frozen,
             migration_status,
         } = config;
@@ -627,6 +679,8 @@ impl ReplayStage {
             duplicate_confirmed_slots_receiver,
             gossip_verified_vote_hash_receiver,
             popular_pruned_forks_receiver,
+            latency_event_sender,
+            latency_event_receiver,
         } = receivers;
 
         trace!("replay stage");
@@ -647,6 +701,11 @@ impl ReplayStage {
         let run_replay = move || {
             let _exit = Finalizer::new(exit.clone());
 
+            // Create latency aggregator for tracking slot pipeline latency
+            let mut latency_aggregator = latency_event_receiver.map(SlotLatencyAggregator::new);
+
+            let mut identity_keypair = cluster_info.keypair();
+            let mut my_pubkey = identity_keypair.pubkey();
             if my_pubkey != tower.node_pubkey {
                 // set-identity was called during the startup procedure, ensure the tower is consistent
                 // before starting the loop. further calls to set-identity will reload the tower in the loop
@@ -776,6 +835,16 @@ impl ReplayStage {
                     let r_bank_forks = bank_forks.read().unwrap();
                     (r_bank_forks.ancestors(), r_bank_forks.descendants())
                 };
+
+                // Record replay wakeup for active slots
+                let active_slots_for_tracking: Vec<_> =
+                    bank_forks.read().unwrap().active_bank_slots();
+                if let Some(ref sender) = replay_batch_sender {
+                    for slot in &active_slots_for_tracking {
+                        sender.record_wakeup(*slot);
+                    }
+                }
+
                 let new_frozen_slots = Self::replay_active_banks(
                     &blockstore,
                     &bank_forks,
@@ -801,6 +870,14 @@ impl ReplayStage {
                     prioritization_fee_cache.as_deref(),
                     &mut purge_repair_slot_counter,
                     (!migration_status.is_alpenglow_enabled()).then_some(&mut tbft_structs),
+                    &latency_event_sender,
+                    deferred_signature_verification,
+                    deferred_poh_verification,
+                    prefetch_accounts,
+                    entry_cache.as_deref(),
+                    dataset_execution_sender.as_deref(),
+                    tick_tracking_sender.as_deref(),
+                    tx_cost_priority_sender.as_deref(),
                     migration_status.as_ref(),
                     &votor_event_sender,
                 );
@@ -822,6 +899,16 @@ impl ReplayStage {
                     }
                 }
                 replay_active_banks_time.stop();
+
+                // Record replay finish for active slots
+                if let Some(ref sender) = replay_batch_sender {
+                    let duration_us = replay_active_banks_time.as_us();
+                    for slot in &active_slots_for_tracking {
+                        // Note: num_entries and num_transactions are tracked per-dataset,
+                        // here we just record the batch timing
+                        sender.record_finish(*slot, 0, 0, duration_us);
+                    }
+                }
 
                 // Check if we've completed the migration conditions
                 if migration_status.is_ready_to_enable() {
@@ -1076,6 +1163,7 @@ impl ReplayStage {
                             );
                         }
 
+                        let old_root = bank_forks.read().unwrap().root();
                         Self::handle_votable_bank(
                             vote_bank,
                             switch_fork_decision,
@@ -1101,6 +1189,13 @@ impl ReplayStage {
                             migration_status.as_ref(),
                             &mut tbft_structs,
                         );
+                        // Report and cleanup latency tracking if root advanced
+                        let new_root = bank_forks.read().unwrap().root();
+                        if new_root > old_root {
+                            if let Some(ref mut agg) = latency_aggregator {
+                                agg.report_and_cleanup(new_root);
+                            }
+                        }
                     }
                     voting_time.stop();
 
@@ -1296,18 +1391,39 @@ impl ReplayStage {
                 }
 
                 let mut wait_receive_time = Measure::start("wait_receive_time");
-                if !did_complete_bank {
+                let wakeup_source = if !did_complete_bank {
                     // only wait for the signal if we did not just process a bank; maybe there are more slots available
-
-                    let timer = Duration::from_millis(100);
-                    let result = ledger_signal_receiver.recv_timeout(timer);
-                    match result {
-                        Err(RecvTimeoutError::Timeout) => (),
-                        Err(_) => break,
-                        Ok(_) => trace!("blockstore signal"),
-                    };
-                }
+                    let timer = Duration::from_micros(50);
+                    select! {
+                        recv(ledger_signal_receiver) -> result => {
+                            match result {
+                                Err(_) => break,
+                                Ok(_) => trace!("blockstore signal"),
+                            }
+                            Some(WakeupSource::BlockstoreSignal)
+                        }
+                        default(timer) => Some(WakeupSource::Timeout),
+                    }
+                } else {
+                    None // No wakeup, we're continuing to process banks
+                };
                 wait_receive_time.stop();
+
+                // Record wakeup event for latency tracking
+                if let (Some(wakeup_src), Some(sender)) =
+                    (wakeup_source, latency_event_sender.as_ref())
+                {
+                    let wakeup_time = Instant::now();
+                    // Get active bank slots we're about to process
+                    let active_slots: Vec<Slot> = bank_forks.read().unwrap().active_bank_slots();
+                    for slot in active_slots {
+                        let _ = sender.try_send(LatencyEvent::ReplayWakeup {
+                            slot,
+                            timestamp: wakeup_time,
+                            source: wakeup_src,
+                        });
+                    }
+                }
 
                 replay_timing.update_common(
                     generate_new_bank_forks_time.as_us(),
@@ -2438,6 +2554,13 @@ impl ReplayStage {
         replay_vote_sender: &ReplayVoteSender,
         log_messages_bytes_limit: Option<usize>,
         prioritization_fee_cache: Option<&PrioritizationFeeCache>,
+        deferred_signature_verification: bool,
+        deferred_poh_verification: bool,
+        prefetch_accounts: bool,
+        entry_cache: Option<&solana_ledger::entry_cache::EntryCache>,
+        dataset_execution_sender: Option<&solana_ledger::dataset_tracking::DatasetExecutionSender>,
+        tick_tracking_sender: Option<&solana_ledger::dataset_tracking::TickTrackingSender>,
+        tx_cost_priority_sender: Option<&solana_ledger::dataset_tracking::TxCostPrioritySender>,
         migration_status: &MigrationStatus,
     ) -> result::Result<usize, BlockstoreProcessorError> {
         let mut w_replay_stats = replay_stats.write().unwrap();
@@ -2453,12 +2576,19 @@ impl ReplayStage {
             &mut w_replay_stats,
             &mut w_replay_progress,
             false,
+            deferred_signature_verification,
+            deferred_poh_verification,
+            prefetch_accounts,
             transaction_status_sender,
             entry_notification_sender,
             Some(replay_vote_sender),
             false,
             log_messages_bytes_limit,
             prioritization_fee_cache,
+            entry_cache,
+            dataset_execution_sender,
+            tick_tracking_sender,
+            tx_cost_priority_sender,
             migration_status,
         )?;
         let tx_count_after = w_replay_progress.num_txs;
@@ -3022,7 +3152,29 @@ impl ReplayStage {
             tower.refresh_last_vote_tx_blockhash(vote_tx.message.recent_blockhash);
 
             let saved_tower = SavedTower::new(tower, identity_keypair).unwrap_or_else(|err| {
+                datapoint_info!(
+                    "tower-save-failure",
+                    ("error", format!("{:?}", err), String),
+                    ("slot", tower.last_voted_slot().unwrap_or(0), i64),
+                    ("tower_size", tower.vote_state.votes.len(), i64),
+                );
                 error!("Unable to create saved tower: {err:?}");
+                let crash_msg = format!("FATAL: Unable to create saved tower: {err:?}");
+                eprintln!("{crash_msg}");
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/var/solana/data/validator-crash.log")
+                {
+                    use std::io::Write;
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let _ = writeln!(f, "[{ts}] {crash_msg}");
+                    let _ = f.flush();
+                }
                 std::process::exit(1);
             });
 
@@ -3105,6 +3257,13 @@ impl ReplayStage {
         log_messages_bytes_limit: Option<usize>,
         active_bank_slots: &[Slot],
         prioritization_fee_cache: Option<&PrioritizationFeeCache>,
+        deferred_signature_verification: bool,
+        deferred_poh_verification: bool,
+        prefetch_accounts: bool,
+        entry_cache: Option<&solana_ledger::entry_cache::EntryCache>,
+        dataset_execution_sender: Option<&solana_ledger::dataset_tracking::DatasetExecutionSender>,
+        tick_tracking_sender: Option<&solana_ledger::dataset_tracking::TickTrackingSender>,
+        tx_cost_priority_sender: Option<&solana_ledger::dataset_tracking::TxCostPrioritySender>,
         migration_status: &MigrationStatus,
     ) -> Vec<ReplaySlotFromBlockstore> {
         // Make mutable shared structures thread safe.
@@ -3187,6 +3346,13 @@ impl ReplayStage {
                             &replay_vote_sender.clone(),
                             log_messages_bytes_limit,
                             prioritization_fee_cache,
+                            deferred_signature_verification,
+                            deferred_poh_verification,
+                            prefetch_accounts,
+                            entry_cache,
+                            dataset_execution_sender,
+                            tick_tracking_sender,
+                            tx_cost_priority_sender,
                             migration_status,
                         );
                         replay_blockstore_time.stop();
@@ -3220,6 +3386,13 @@ impl ReplayStage {
         log_messages_bytes_limit: Option<usize>,
         bank_slot: Slot,
         prioritization_fee_cache: Option<&PrioritizationFeeCache>,
+        deferred_signature_verification: bool,
+        deferred_poh_verification: bool,
+        prefetch_accounts: bool,
+        entry_cache: Option<&solana_ledger::entry_cache::EntryCache>,
+        dataset_execution_sender: Option<&solana_ledger::dataset_tracking::DatasetExecutionSender>,
+        tick_tracking_sender: Option<&solana_ledger::dataset_tracking::TickTrackingSender>,
+        tx_cost_priority_sender: Option<&solana_ledger::dataset_tracking::TxCostPrioritySender>,
         migration_status: &MigrationStatus,
     ) -> ReplaySlotFromBlockstore {
         let mut replay_result = ReplaySlotFromBlockstore {
@@ -3298,6 +3471,13 @@ impl ReplayStage {
                     &replay_vote_sender.clone(),
                     log_messages_bytes_limit,
                     prioritization_fee_cache,
+                    deferred_signature_verification,
+                    deferred_poh_verification,
+                    prefetch_accounts,
+                    entry_cache,
+                    dataset_execution_sender,
+                    tick_tracking_sender,
+                    tx_cost_priority_sender,
                     migration_status,
                 );
                 replay_blockstore_time.stop();
@@ -3328,6 +3508,9 @@ impl ReplayStage {
         purge_repair_slot_counter: &mut PurgeRepairSlotCounter,
         my_pubkey: &Pubkey,
         mut tbft_structs: Option<&mut TowerBFTStructures>,
+        latency_event_sender: &Option<LatencyEventSender>,
+        replay_timing: &mut ReplayLoopTiming,
+        dataset_execution_sender: Option<&solana_ledger::dataset_tracking::DatasetExecutionSender>,
         migration_status: &MigrationStatus,
         votor_event_sender: &VotorEventSender,
     ) -> Vec<Slot> {
@@ -3380,9 +3563,12 @@ impl ReplayStage {
                 let replay_stats = bank_progress.replay_stats.clone();
                 let mut is_unified_scheduler_enabled = false;
 
+                let mut wait_scheduler_time = Measure::start("wait_scheduler");
                 let replay_err = if let Some((result, completed_execute_timings)) =
                     bank.wait_for_completed_scheduler()
                 {
+                    wait_scheduler_time.stop();
+                    replay_timing.wait_scheduler_us += wait_scheduler_time.as_us();
                     // It's guaranteed that wait_for_completed_scheduler() returns Some(_), iff the
                     // unified scheduler is enabled for the bank.
                     is_unified_scheduler_enabled = true;
@@ -3442,6 +3628,13 @@ impl ReplayStage {
                     // don't try to run the remaining normal processing for the completed bank
                     continue;
                 }
+
+                // Signal slot completion (triggers CSV flush)
+                if let Some(exec_sender) = dataset_execution_sender {
+                    exec_sender.finalize_slot(bank.slot());
+                }
+
+
                 let is_leader_block = bank.leader_id() == my_pubkey;
                 let block_id = if !is_leader_block {
                     // If the block does not have at least DATA_SHREDS_PER_FEC_BLOCK correctly retransmitted
@@ -3477,12 +3670,29 @@ impl ReplayStage {
                 bank.set_block_id(block_id);
                 // Freeze the bank before sending to any auxiliary threads
                 // that may expect to be operating on a frozen bank
+                let mut freeze_bank_time = Measure::start("freeze_bank");
                 bank.freeze();
-                datapoint_info!(
-                    "bank_frozen",
-                    ("slot", bank_slot, i64),
-                    ("hash", bank.hash().to_string(), String),
-                );
+                freeze_bank_time.stop();
+                replay_timing.freeze_bank_us += freeze_bank_time.as_us();
+
+                // Record BankFrozen event for latency tracking
+                if let Some(sender) = latency_event_sender {
+                    let _ = sender.try_send(LatencyEvent::BankFrozen {
+                        slot: bank_slot,
+                        timestamp: Instant::now(),
+                    });
+                }
+
+                // LATENCY OPTIMIZATION: Disabled datapoint collection in hot path.
+                // This datapoint is called every time a bank is frozen.
+                #[allow(unreachable_code)]
+                if false {
+                    datapoint_info!(
+                        "bank_frozen",
+                        ("slot", bank_slot, i64),
+                        ("hash", bank.hash().to_string(), String),
+                    );
+                }
 
                 let r_replay_stats = replay_stats.read().unwrap();
                 let replay_progress = bank_progress.replay_progress.clone();
@@ -3692,6 +3902,14 @@ impl ReplayStage {
         prioritization_fee_cache: Option<&PrioritizationFeeCache>,
         purge_repair_slot_counter: &mut PurgeRepairSlotCounter,
         tbft_structs: Option<&mut TowerBFTStructures>,
+        latency_event_sender: &Option<LatencyEventSender>,
+        deferred_signature_verification: bool,
+        deferred_poh_verification: bool,
+        prefetch_accounts: bool,
+        entry_cache: Option<&solana_ledger::entry_cache::EntryCache>,
+        dataset_execution_sender: Option<&solana_ledger::dataset_tracking::DatasetExecutionSender>,
+        tick_tracking_sender: Option<&solana_ledger::dataset_tracking::TickTrackingSender>,
+        tx_cost_priority_sender: Option<&solana_ledger::dataset_tracking::TxCostPrioritySender>,
         migration_status: &MigrationStatus,
         votor_event_sender: &VotorEventSender,
     ) -> Vec<Slot> /* completed slots */ {
@@ -3702,6 +3920,7 @@ impl ReplayStage {
             return vec![];
         }
 
+        let mut execute_batches_time = Measure::start("execute_batches");
         let replay_result_vec = match replay_mode {
             // Skip the overhead of the threadpool if there is only one bank to play
             ForkReplayMode::Parallel(fork_thread_pool) if num_active_banks > 1 => {
@@ -3720,6 +3939,13 @@ impl ReplayStage {
                     log_messages_bytes_limit,
                     &active_bank_slots,
                     prioritization_fee_cache,
+                    deferred_signature_verification,
+                    deferred_poh_verification,
+                    prefetch_accounts,
+                    entry_cache,
+                    dataset_execution_sender,
+                    tick_tracking_sender,
+                    tx_cost_priority_sender,
                     migration_status,
                 )
             }
@@ -3740,13 +3966,23 @@ impl ReplayStage {
                         log_messages_bytes_limit,
                         *bank_slot,
                         prioritization_fee_cache,
+                        deferred_signature_verification,
+                        deferred_poh_verification,
+                        prefetch_accounts,
+                        entry_cache,
+                        dataset_execution_sender,
+                        tick_tracking_sender,
+                        tx_cost_priority_sender,
                         migration_status,
                     )
                 })
                 .collect(),
         };
+        execute_batches_time.stop();
+        replay_timing.execute_batches_us += execute_batches_time.as_us();
 
-        Self::process_replay_results(
+        let mut process_results_time = Measure::start("process_results");
+        let result = Self::process_replay_results(
             blockstore,
             bank_forks,
             progress,
@@ -3765,9 +4001,15 @@ impl ReplayStage {
             purge_repair_slot_counter,
             my_pubkey,
             tbft_structs,
+            latency_event_sender,
+            replay_timing,
+            dataset_execution_sender,
             migration_status,
             votor_event_sender,
-        )
+        );
+        process_results_time.stop();
+        replay_timing.process_results_us += process_results_time.as_us();
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3883,12 +4125,17 @@ impl ReplayStage {
                     stats.my_latest_landed_vote = my_latest_landed_vote;
                     stats.computed = true;
                     new_stats.push(bank_slot);
-                    datapoint_info!(
-                        "bank_weight",
-                        ("slot", bank_slot, i64),
-                        ("fork_stake", stats.fork_stake, i64),
-                        ("fork_weight", stats.fork_weight(), f64),
-                    );
+                    // LATENCY OPTIMIZATION: Disabled datapoint collection in hot path.
+                    // This datapoint is called during compute_bank_stats for every frozen bank.
+                    #[allow(unreachable_code)]
+                    if false {
+                        datapoint_info!(
+                            "bank_weight",
+                            ("slot", bank_slot, i64),
+                            ("fork_stake", stats.fork_stake, i64),
+                            ("fork_weight", stats.fork_weight(), f64),
+                        );
+                    }
 
                     info!(
                         "{} slot_weight: {} {:.1}% {}",
@@ -5449,6 +5696,13 @@ pub(crate) mod tests {
                 &replay_vote_sender,
                 None,
                 Some(&PrioritizationFeeCache::new(0u64)),
+                false, // deferred_signature_verification
+                false, // deferred_poh_verification
+                false, // prefetch_accounts
+                None,  // entry_cache
+                None,  // dataset_execution_sender
+                None,  // tick_tracking_sender
+                None,  // tx_cost_priority_sender
                 &MigrationStatus::default(),
             )
             .and_then(|replay_tx_count| {
@@ -10056,5 +10310,251 @@ pub(crate) mod tests {
             &ancestor_hashes_replay_update_sender,
             &mut PurgeRepairSlotCounter::default(),
         );
+    }
+
+    #[test]
+    fn test_alpenglow_poh_migration_from_leader() {
+        agave_logger::setup();
+
+        let ReplayBlockstoreComponents {
+            blockstore,
+            my_pubkey,
+            leader_schedule_cache,
+            poh_recorder,
+            mut poh_controller,
+            vote_simulator,
+            rpc_subscriptions,
+            ..
+        } = replay_blockstore_components(None, 1, None);
+        let VoteSimulator {
+            bank_forks,
+            mut progress,
+            ..
+        } = vote_simulator;
+        let rpc_subscriptions = Some(rpc_subscriptions);
+
+        let working_bank = bank_forks.read().unwrap().working_bank();
+        assert!(working_bank.is_complete());
+        assert!(working_bank.is_frozen());
+
+        let poh_slot = working_bank.slot() + 2;
+        let alpenglow_slot = working_bank.slot() + 3;
+        let initial_slot = working_bank.slot();
+        let mut is_alpenglow_migration_complete = false;
+
+        // Reset PoH recorder to the completed bank to ensure consistent state
+        ReplayStage::reset_poh_recorder(
+            &my_pubkey,
+            &blockstore,
+            working_bank.clone(),
+            &mut poh_controller,
+            &leader_schedule_cache,
+        );
+        wait_for_poh_service(&poh_controller);
+
+        // Register just over one slot worth of ticks directly with PoH recorder
+        let num_poh_ticks =
+            (working_bank.ticks_per_slot() * working_bank.hashes_per_tick().unwrap()) + 1;
+        poh_recorder
+            .write()
+            .map(|mut poh_recorder| {
+                for _ in 0..num_poh_ticks + 1 {
+                    poh_recorder.tick();
+                }
+            })
+            .unwrap();
+
+        let poh_recorder = Arc::new(poh_recorder);
+        let (retransmit_slots_sender, _) = unbounded();
+        let (banking_tracer, _) = BankingTracer::new(None).unwrap();
+        let has_new_vote_been_rooted = true;
+
+        // We should start leader for the poh slot, however alpenglow migration should not be started
+        assert!(ReplayStage::maybe_start_leader(
+            &my_pubkey,
+            &bank_forks,
+            &poh_recorder,
+            &mut poh_controller,
+            &leader_schedule_cache,
+            rpc_subscriptions.as_deref(),
+            &None,
+            &mut progress,
+            &retransmit_slots_sender,
+            &mut SkippedSlotsInfo::default(),
+            &banking_tracer,
+            has_new_vote_been_rooted,
+            &None,
+            &mut is_alpenglow_migration_complete,
+        )
+        .is_some());
+        assert!(!is_alpenglow_migration_complete);
+        wait_for_poh_service(&poh_controller);
+        let working_bank = bank_forks.read().unwrap().working_bank();
+        assert_eq!(working_bank.slot(), poh_slot);
+        assert_eq!(working_bank.parent_slot(), initial_slot);
+
+        // Register another slots worth of ticks with PoH recorder
+        poh_recorder
+            .write()
+            .map(|mut poh_recorder| {
+                for _ in 0..num_poh_ticks + 1 {
+                    poh_recorder.tick();
+                }
+            })
+            .unwrap();
+
+        // We should now *fail* to start leader for the alpenglow slot,
+        // however the migration must have succeeded
+        assert!(ReplayStage::maybe_start_leader(
+            &my_pubkey,
+            &bank_forks,
+            &poh_recorder,
+            &mut poh_controller,
+            &leader_schedule_cache,
+            rpc_subscriptions.as_deref(),
+            &None,
+            &mut progress,
+            &retransmit_slots_sender,
+            &mut SkippedSlotsInfo::default(),
+            &banking_tracer,
+            has_new_vote_been_rooted,
+            &Some(alpenglow_slot),
+            &mut is_alpenglow_migration_complete,
+        )
+        .is_none());
+        assert!(is_alpenglow_migration_complete);
+        wait_for_poh_service(&poh_controller);
+
+        // Working bank should not be updated past the poh slot
+        let working_bank = bank_forks.read().unwrap().working_bank();
+        assert_eq!(working_bank.slot(), poh_slot);
+        assert_eq!(working_bank.parent_slot(), initial_slot);
+    }
+
+    #[test]
+    fn test_alpenglow_poh_migration_from_replay() {
+        agave_logger::setup();
+
+        let ReplayBlockstoreComponents {
+            blockstore,
+            my_pubkey,
+            poh_recorder,
+            vote_simulator,
+            ..
+        } = replay_blockstore_components(Some(tr(0) / tr(1) / tr(2) / tr(3) / tr(4)), 1, None);
+        let VoteSimulator {
+            bank_forks,
+            mut progress,
+            mut latest_validator_votes_for_frozen_banks,
+            mut tbft_structs,
+            ..
+        } = vote_simulator;
+        let (cluster_slots_update_sender, _cluster_slots_update_receiver) = unbounded();
+        let (cost_update_sender, _cost_update_receiver) = unbounded();
+        let (ancestor_hashes_replay_update_sender, _ancestor_hashes_replay_update_receiver) =
+            unbounded();
+
+        let poh_slot = bank_forks.read().unwrap().highest_slot() + 1;
+        let first_alpenglow_slot = bank_forks.read().unwrap().highest_slot() + 2;
+        let mut is_alpenglow_migration_complete = false;
+
+        // Finishing the poh slot should not trigger migration
+        let parent_bank = bank_forks.read().unwrap().working_bank();
+        let poh_bank = Bank::new_from_parent(parent_bank, &Pubkey::new_unique(), poh_slot);
+        poh_bank.set_tick_height(poh_bank.max_tick_height());
+        progress.insert(
+            poh_slot,
+            ForkProgress::new_from_bank(
+                &poh_bank,
+                poh_bank.leader_id(),
+                &Pubkey::new_unique(),
+                Some(0),
+                0,
+                0,
+            ),
+        );
+        bank_forks.write().unwrap().insert(poh_bank);
+        let replay_result_vec = vec![ReplaySlotFromBlockstore {
+            is_slot_dead: false,
+            bank_slot: poh_slot,
+            replay_result: None,
+        }];
+
+        ReplayStage::process_replay_results(
+            &blockstore,
+            &bank_forks,
+            &mut progress,
+            None,
+            &None,
+            None,
+            &None,
+            &mut latest_validator_votes_for_frozen_banks,
+            &cluster_slots_update_sender,
+            &cost_update_sender,
+            &mut DuplicateSlotsToRepair::default(),
+            &ancestor_hashes_replay_update_sender,
+            None,
+            &replay_result_vec,
+            &mut PurgeRepairSlotCounter::default(),
+            &my_pubkey,
+            Some(first_alpenglow_slot),
+            &poh_recorder,
+            &mut is_alpenglow_migration_complete,
+            Some(&mut tbft_structs),
+            &None,
+            &mut ReplayLoopTiming::default(),
+            None,
+        );
+        assert!(!is_alpenglow_migration_complete);
+
+        // Finishing the alpenglow slot should now trigger the migration
+        let parent_bank = bank_forks.read().unwrap().working_bank();
+        let ag_bank =
+            Bank::new_from_parent(parent_bank, &Pubkey::new_unique(), first_alpenglow_slot);
+        ag_bank.set_tick_height(ag_bank.max_tick_height());
+        progress.insert(
+            first_alpenglow_slot,
+            ForkProgress::new_from_bank(
+                &ag_bank,
+                ag_bank.leader_id(),
+                &Pubkey::new_unique(),
+                Some(0),
+                0,
+                0,
+            ),
+        );
+        bank_forks.write().unwrap().insert(ag_bank);
+        let replay_result_vec = vec![ReplaySlotFromBlockstore {
+            is_slot_dead: false,
+            bank_slot: first_alpenglow_slot,
+            replay_result: None,
+        }];
+
+        ReplayStage::process_replay_results(
+            &blockstore,
+            &bank_forks,
+            &mut progress,
+            None,
+            &None,
+            None,
+            &None,
+            &mut latest_validator_votes_for_frozen_banks,
+            &cluster_slots_update_sender,
+            &cost_update_sender,
+            &mut DuplicateSlotsToRepair::default(),
+            &ancestor_hashes_replay_update_sender,
+            None,
+            &replay_result_vec,
+            &mut PurgeRepairSlotCounter::default(),
+            &my_pubkey,
+            Some(first_alpenglow_slot),
+            &poh_recorder,
+            &mut is_alpenglow_migration_complete,
+            Some(&mut tbft_structs),
+            &None,
+            &mut ReplayLoopTiming::default(),
+            None,
+        );
+        assert!(is_alpenglow_migration_complete);
     }
 }

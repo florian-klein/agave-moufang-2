@@ -1,0 +1,12 @@
+{
+  "libpath": "./target/release/libgeyser_shm_plugin.so",
+  "shm_path": "/moufang_accounts",
+  "capacity_mb": 512,
+  "filter_port": 5681,
+
+  "write_all_by_default": false,
+  "queue_cap": 262144,
+
+  "writer_core": 10,
+  "rt_prio": 40
+}

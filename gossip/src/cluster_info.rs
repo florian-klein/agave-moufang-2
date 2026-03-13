@@ -1686,6 +1686,7 @@ impl ClusterInfo {
                         GossipFilterDirection::EgressPullResponse,
                     )
                 },
+                self.my_shred_version(),
                 &self.stats,
             )
         };
@@ -2284,6 +2285,25 @@ impl ClusterInfo {
                                     "duplicate running instances of the same validator node: {}",
                                     self.id()
                                 );
+                                let crash_msg = format!(
+                                    "FATAL: duplicate running instances of the same validator node: {}",
+                                    self.id()
+                                );
+                                eprintln!("{crash_msg}");
+                                let _ = std::io::Write::flush(&mut std::io::stderr());
+                                if let Ok(mut f) = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open("/var/solana/data/validator-crash.log")
+                                {
+                                    use std::io::Write;
+                                    let ts = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    let _ = writeln!(f, "[{ts}] {crash_msg}");
+                                    let _ = f.flush();
+                                }
                                 exit.store(true, Ordering::Relaxed);
                                 // TODO: Pass through Exit here so
                                 // that this will exit cleanly.

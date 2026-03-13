@@ -97,10 +97,11 @@ impl<T: Serialize + Clone> StatusCache<T> {
                                 o_key_list.remove_entry();
                             }
                         } else {
-                            panic!(
-                                "Map for key must exist if key exists in self.slot_deltas, slot: \
-                                 {slot}"
-                            )
+                            warn!(
+                                "clear_slot_entries: key not found in cache for slot {slot}, \
+                                 blockhash {blockhash} (entry may have been cleared by a \
+                                 concurrent purge)"
+                            );
                         }
                     }
 
@@ -108,7 +109,10 @@ impl<T: Serialize + Clone> StatusCache<T> {
                         o_blockhash_entries.remove_entry();
                     }
                 } else {
-                    panic!("Blockhash must exist if it exists in self.slot_deltas, slot: {slot}")
+                    warn!(
+                        "clear_slot_entries: blockhash {blockhash} not found in cache for \
+                         slot {slot} (entry may have been cleared by a concurrent purge)"
+                    );
                 }
             }
         }
@@ -369,7 +373,7 @@ mod tests {
         let sig = Signature::default();
         let mut status_cache = BankStatusCache::default();
         let blockhash = hash(Hash::default().as_ref());
-        let ancestors = Ancestors::from(vec![0]);
+        let ancestors = vec![(0, 1)].into_iter().collect();
         status_cache.insert(&blockhash, sig, 0, ());
         assert_eq!(
             status_cache.get_status(sig, &blockhash, &ancestors),
@@ -411,7 +415,7 @@ mod tests {
         let sig = Signature::default();
         let mut status_cache = BankStatusCache::default();
         let blockhash = hash(Hash::default().as_ref());
-        let ancestors = Ancestors::from(vec![0]);
+        let ancestors = vec![(0, 0)].into_iter().collect();
         status_cache.insert(&blockhash, sig, 0, ());
         status_cache.insert(&blockhash, sig, 1, ());
         for i in 0..(MAX_CACHE_ENTRIES + 1) {
@@ -524,9 +528,9 @@ mod tests {
         status_cache.insert(&blockhash2, sig, 1, ());
 
         let mut ancestors0 = Ancestors::default();
-        ancestors0.insert(0);
+        ancestors0.insert(0, 0);
         let mut ancestors1 = Ancestors::default();
-        ancestors1.insert(1);
+        ancestors1.insert(1, 0);
 
         // Clear slot 0 related data
         assert!(
@@ -577,7 +581,7 @@ mod tests {
     #[test]
     fn test_different_sized_keys() {
         let mut status_cache = BankStatusCache::default();
-        let ancestors = Ancestors::from(vec![0]);
+        let ancestors = vec![(0, 0)].into_iter().collect();
         let blockhash = Hash::default();
         for _ in 0..100 {
             let blockhash = hash(blockhash.as_ref());
@@ -646,7 +650,7 @@ mod shuttle_tests {
         th_insert.join().unwrap();
 
         let mut ancestors2 = Ancestors::default();
-        ancestors2.insert(2);
+        ancestors2.insert(2, 0);
 
         assert!(
             status_cache
@@ -719,7 +723,7 @@ mod shuttle_tests {
         th_insert.join().unwrap();
 
         let mut ancestors2 = Ancestors::default();
-        ancestors2.insert(MAX_CACHE_ENTRIES as Slot + 2);
+        ancestors2.insert(MAX_CACHE_ENTRIES as Slot + 2, 0);
 
         assert!(
             status_cache
@@ -772,9 +776,9 @@ mod shuttle_tests {
         }
 
         let mut ancestors = Ancestors::default();
-        ancestors.insert(1);
-        ancestors.insert(2);
-        ancestors.insert(3);
+        ancestors.insert(1, 0);
+        ancestors.insert(2, 0);
+        ancestors.insert(3, 0);
 
         // verify all 100 inserts are visible
         for i in 0..N_INSERTS {

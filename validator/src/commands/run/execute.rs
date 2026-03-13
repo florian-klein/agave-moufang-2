@@ -119,7 +119,6 @@ pub fn execute(
         tvu_receive_threads,
         tvu_retransmit_threads,
         tvu_sigverify_threads,
-        tvu_bls_sigverify_threads,
     } = cli::thread_args::parse_num_threads_args(matches);
 
     let identity_keypair = Arc::new(run_args.identity_keypair);
@@ -629,15 +628,20 @@ pub fn execute(
         .unzip();
 
     let read_cache_limit_bytes =
-        values_of::<usize>(matches, "accounts_db_read_cache_limit").map(|limits| {
-            match limits.len() {
-                2 => (limits[0], limits[1]),
-                _ => {
-                    // clap will enforce two values are given
-                    unreachable!("invalid number of values given to accounts-db-read-cache-limit")
+        values_of::<usize>(matches, "accounts_db_read_cache_limit")
+            .map(|limits| {
+                match limits.len() {
+                    2 => (limits[0], limits[1]),
+                    _ => {
+                        // clap will enforce two values are given
+                        unreachable!("invalid number of values given to accounts-db-read-cache-limit")
+                    }
                 }
-            }
-        });
+            })
+            .or_else(|| {
+                // Default to 12GB read cache for readonly/observer mode performance
+                Some((12_000_000_000, 12_500_000_000))  // 12GB low, 12.5GB high
+            });
 
     let storage_access = matches
         .value_of("accounts_db_access_storages_method")
@@ -786,13 +790,28 @@ pub fn execute(
         voting_disabled: matches.is_present("no_voting") || restricted_repair_only_mode,
         wait_for_supermajority: value_t!(matches, "wait_for_supermajority", Slot).ok(),
         known_validators: run_args.known_validators,
+        trusted_shred_publishers: run_args.trusted_shred_publishers,
         repair_validators,
         repair_whitelist,
         repair_handler_type: RepairHandlerType::default(),
         gossip_validators,
         max_ledger_shreds,
         blockstore_options: run_args.blockstore_options,
-        run_verification: !matches.is_present("skip_startup_ledger_verification"),
+        run_verification: false,  // Skip verification by default for performance (readonly/trusted mode)
+        deferred_signature_verification: true,  // Execute before signature verification (10-100ms latency reduction)
+        deferred_poh_verification: true,  // Execute before PoH verification (1-10ms latency reduction)
+        prefetch_accounts: true,  // Prefetch accounts during verification (reduces execution latency)
+        entry_cache: if matches.is_present("no_entry_cache") {
+            None
+        } else {
+            Some(std::sync::Arc::new(solana_ledger::entry_cache::EntryCache::new(32)))
+        },
+        shred_arrival_tracing_enabled: matches.is_present("enable_shred_arrival_tracing"),
+        shred_arrival_output_dir: PathBuf::from(
+            matches
+                .value_of("shred_arrival_output_dir")
+                .unwrap_or("shred_arrivals"),
+        ),
         debug_keys,
         warp_slot: None,
         generator_config: None,
@@ -831,7 +850,6 @@ pub fn execute(
         replay_forks_threads,
         replay_transactions_threads,
         tvu_shred_sigverify_threads: tvu_sigverify_threads,
-        tvu_bls_sigverify_threads,
         delay_leader_block_for_pending_fork: matches
             .is_present("delay_leader_block_for_pending_fork"),
         turbine_disabled: Arc::<AtomicBool>::default(),
@@ -869,6 +887,7 @@ pub fn execute(
             Arc::new(AtomicBool::new(false)),
         )]
         .into(),
+        shredstream_config: parse_shredstream_config(matches),
         voting_service_test_override: None,
         snapshot_packager_niceness_adj: value_t_or_exit!(
             matches,
@@ -890,6 +909,17 @@ pub fn execute(
         value_t_or_exit!(matches, "minimal_snapshot_download_speed", f32);
     let maximum_snapshot_download_abort =
         value_t_or_exit!(matches, "maximum_snapshot_download_abort", u64);
+
+    if matches!(
+        validator_config.block_production_method,
+        BlockProductionMethod::UnifiedScheduler
+    ) {
+        warn!(
+            "Currently, the unified-scheduler method is experimental for block-production. It has \
+             known security issues and should be used only for developing and benchmarking \
+             purposes"
+        );
+    }
 
     let public_rpc_addr = matches
         .value_of("public_rpc_addr")
@@ -1367,4 +1397,37 @@ fn new_snapshot_config(
     }
 
     Ok(snapshot_config)
+}
+
+fn parse_shredstream_config(matches: &ArgMatches) -> solana_core::shredstream::ShredstreamConfig {
+    use solana_core::shredstream::ShredstreamConfig;
+
+    if !matches.is_present("shredstream_enable") {
+        return ShredstreamConfig::default();
+    }
+
+    let block_engine_url = matches
+        .value_of("shredstream_block_engine_url")
+        .map(String::from);
+
+    let auth_keypair_path = matches
+        .value_of("shredstream_auth_keypair")
+        .map(PathBuf::from);
+
+    let regions: Vec<String> = matches
+        .value_of("shredstream_regions")
+        .map(|s| s.split(',').map(|r| r.trim().to_string()).collect())
+        .unwrap_or_default();
+
+    let public_ip = matches
+        .value_of("shredstream_public_ip")
+        .and_then(|s| s.parse().ok());
+
+    ShredstreamConfig {
+        enabled: true,
+        block_engine_url,
+        auth_keypair_path,
+        regions,
+        public_ip,
+    }
 }

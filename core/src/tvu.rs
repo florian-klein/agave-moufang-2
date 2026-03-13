@@ -19,7 +19,8 @@ use {
         drop_bank_service::DropBankService,
         repair::repair_service::{OutstandingShredRepairs, RepairInfo, RepairServiceChannels},
         replay_stage::{ReplayReceivers, ReplaySenders, ReplayStage, ReplayStageConfig},
-        shred_fetch_stage::{SHRED_FETCH_CHANNEL_SIZE, ShredFetchStage},
+        shred_fetch_stage::{ShredFetchStage, SHRED_FETCH_CHANNEL_SIZE},
+        slot_latency_tracker::create_latency_channel,
         voting_service::VotingService,
         warm_quic_cache_service::WarmQuicCacheService,
         window_service::{WindowService, WindowServiceChannels},
@@ -32,7 +33,6 @@ use {
         voting_service::{VotingService as BLSVotingService, VotingServiceOverride},
         votor::{Votor, VotorConfig},
     },
-    agave_votor_messages::reward_certificate::{BuildRewardCertsRequest, BuildRewardCertsResponse},
     agave_xdp::xdp_retransmitter::XdpSender,
     bytes::Bytes,
     crossbeam_channel::{Receiver, Sender, bounded, unbounded},
@@ -46,9 +46,26 @@ use {
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_ledger::{
-        blockstore::Blockstore, blockstore_cleanup_service::BlockstoreCleanupService,
-        blockstore_processor::TransactionStatusSender, entry_notifier_service::EntryNotifierSender,
+        blockstore::Blockstore,
+        blockstore_cleanup_service::BlockstoreCleanupService,
+        blockstore_processor::TransactionStatusSender,
+        dataset_tracking::{
+            BlockstoreInsertPhaseCsvWriter, BlockstoreInsertPhaseSender,
+            DatasetExecutionCsvWriter, DatasetExecutionSender, DatasetSignatureCsvWriter,
+            DatasetSignatureSender, ReplayBatchCsvWriter, ReplayBatchSender,
+            ShredInsertCsvWriter, ShredInsertSender, TickTrackingCsvWriter,
+            TickTrackingSender, TxCostPriorityCsvWriter, TxCostPrioritySender,
+            TxExecutionCsvWriter, TxExecutionSender,
+        },
+        entry_notifier_service::EntryNotifierSender,
+        fetch_stage_tracer::{
+            create_fetch_stage_tracer, FetchStageArrivalCsvWriter, FetchStageArrivalSender,
+        },
         leader_schedule_cache::LeaderScheduleCache,
+        shred_arrival_store::{ShredArrivalBuffer, ShredArrivalCsvWriter},
+        window_service_tracer::{
+            create_window_service_tracer, WindowServiceEventCsvWriter, WindowServiceEventSender,
+        },
     },
     solana_poh::{poh_controller::PohController, poh_recorder::PohRecorder},
     solana_pubkey::Pubkey,
@@ -72,7 +89,8 @@ use {
         collections::HashSet,
         net::{SocketAddr, UdpSocket},
         num::NonZeroUsize,
-        sync::{Arc, RwLock, atomic::AtomicBool},
+        path::PathBuf,
+        sync::{atomic::AtomicBool, Arc, RwLock},
         thread::{self, JoinHandle},
     },
     tokio::sync::mpsc::Sender as AsyncSender,
@@ -97,7 +115,6 @@ const MAX_BLS_MESSAGES_TO_SEND: usize = 1000;
 pub struct Tvu {
     fetch_stage: ShredFetchStage,
     shred_sigverify: JoinHandle<()>,
-    retransmit_stage: RetransmitStage,
     window_service: WindowService,
     cluster_slots_service: ClusterSlotsService,
     replay_stage: ReplayStage,
@@ -108,15 +125,31 @@ pub struct Tvu {
     warm_quic_cache_service: Option<WarmQuicCacheService>,
     drop_bank_service: DropBankService,
     duplicate_shred_listener: DuplicateShredListener,
+    /// Optional CSV writer for shred arrival tracing
+    shred_arrival_csv_writer: Option<ShredArrivalCsvWriter>,
+    /// Optional CSV writer for dataset signature tracking
+    dataset_signature_csv_writer: Option<DatasetSignatureCsvWriter>,
+    /// Optional CSV writer for dataset execution tracking
+    dataset_execution_csv_writer: Option<DatasetExecutionCsvWriter>,
+    /// Optional CSV writer for tick tracking
+    tick_tracking_csv_writer: Option<TickTrackingCsvWriter>,
+    /// Optional CSV writer for replay batch tracking
+    replay_batch_csv_writer: Option<ReplayBatchCsvWriter>,
+    /// Optional CSV writer for blockstore insert phase tracking
+    blockstore_insert_phase_csv_writer: Option<BlockstoreInsertPhaseCsvWriter>,
+    /// Optional CSV writer for per-shred insert tracking
+    shred_insert_csv_writer: Option<ShredInsertCsvWriter>,
+    /// Optional CSV writer for fetch stage arrival tracing
+    fetch_stage_arrival_csv_writer: Option<FetchStageArrivalCsvWriter>,
+    /// Optional CSV writer for window service event tracing
+    window_service_event_csv_writer: Option<WindowServiceEventCsvWriter>,
+    /// Optional CSV writer for per-transaction execution tracking
+    tx_execution_csv_writer: Option<TxExecutionCsvWriter>,
+    /// Optional parquet writer for per-transaction cost/priority tracking
+    tx_cost_priority_csv_writer: Option<TxCostPriorityCsvWriter>,
     bls_sigverify_threads: Option<(JoinHandle<()>, JoinHandle<()>)>,
     votor: Votor,
     commitment_service: AggregateCommitmentService,
-
-    // TODO: these will be used when the block component processor is upstreamed
-    #[allow(dead_code)]
-    reward_certs_receiver: Receiver<BuildRewardCertsResponse>,
-    #[allow(dead_code)]
-    build_reward_certs_sender: Sender<BuildRewardCertsRequest>,
 }
 
 pub struct TvuSockets {
@@ -138,8 +171,33 @@ pub struct TvuConfig {
     pub replay_forks_threads: NonZeroUsize,
     pub replay_transactions_threads: NonZeroUsize,
     pub shred_sigverify_threads: NonZeroUsize,
-    pub bls_sigverify_threads: NonZeroUsize,
     pub xdp_sender: Option<XdpSender>,
+    pub trusted_shred_publishers: Arc<std::collections::HashSet<std::net::IpAddr>>,
+    /// When true, execute transactions before signature verification completes.
+    /// Signature verification runs asynchronously after execution, reducing
+    /// latency for ShmPlugin notifications by 10-100ms. Consensus safety is maintained.
+    pub deferred_signature_verification: bool,
+    /// When true, execute transactions before PoH verification completes.
+    /// PoH verification runs after execution, reducing latency for ShmPlugin notifications.
+    pub deferred_poh_verification: bool,
+    /// When true, prefetch accounts into the read cache in background while
+    /// verification runs, reducing latency for transaction execution.
+    pub prefetch_accounts: bool,
+    /// Optional entry cache for low-latency entry access during replay.
+    /// When provided, entries are read from cache first, falling back to blockstore.
+    pub entry_cache: Option<Arc<solana_ledger::entry_cache::EntryCache>>,
+    /// Enable shred arrival tracing to CSV files
+    pub shred_arrival_tracing_enabled: bool,
+    /// Directory for shred arrival CSV files
+    pub shred_arrival_output_dir: PathBuf,
+    /// Optional pre-created sender for per-transaction execution timing.
+    /// When provided (along with tx_execution_receiver), the Tvu will use this
+    /// sender (shared with the scheduler pool) instead of creating its own.
+    pub tx_execution_sender: Option<Arc<TxExecutionSender>>,
+    /// Optional receiver for per-transaction execution records.
+    /// Used to create the CSV writer when tx_execution_sender is provided.
+    pub tx_execution_receiver:
+        Option<crossbeam_channel::Receiver<solana_ledger::dataset_tracking::TxExecutionRecord>>,
 }
 
 impl Default for TvuConfig {
@@ -153,8 +211,17 @@ impl Default for TvuConfig {
             replay_forks_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             replay_transactions_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             shred_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
-            bls_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             xdp_sender: None,
+            trusted_shred_publishers: Arc::default(),
+            deferred_signature_verification: false,
+            // OPTIMIZATION: Enable deferred PoH verification for lower latency (1-10ms savings)
+            deferred_poh_verification: true,
+            prefetch_accounts: false,
+            entry_cache: None,
+            shred_arrival_tracing_enabled: false,
+            shred_arrival_output_dir: PathBuf::from("shred_arrivals"),
+            tx_execution_sender: None,
+            tx_execution_receiver: None,
         }
     }
 }
@@ -227,6 +294,7 @@ impl Tvu {
         prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
         banking_tracer: Arc<BankingTracer>,
         repair_response_quic_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
+        turbine_quic_endpoint_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
         repair_request_quic_sender: AsyncSender<(SocketAddr, Bytes)>,
         ancestor_hashes_request_quic_sender: AsyncSender<(SocketAddr, Bytes)>,
         ancestor_hashes_response_quic_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
@@ -262,9 +330,10 @@ impl Tvu {
         // streamer and sigverify for A2A BLS messages
         let (consensus_message_sender, consensus_message_receiver) =
             bounded(MAX_ALPENGLOW_PACKET_NUM);
-        let (reward_votes_sender, reward_votes_receiver) = bounded(MAX_ALPENGLOW_PACKET_NUM);
         let (consensus_metrics_sender, consensus_metrics_receiver) =
             bounded(MAX_IN_FLIGHT_CONSENSUS_EVENTS);
+        // TODO: once the bls sigverifier is upstreamed, it will need the sender side.
+        let (_reward_votes_sender, reward_votes_receiver) = bounded(MAX_ALPENGLOW_PACKET_NUM);
 
         // The BLS socket is currently only available on Testnet and Development clusters.
         // Closer to release we will enable this for all clusters.
@@ -277,7 +346,7 @@ impl Tvu {
                     thread: bls_streamer_t,
                     key_updater: bls_key_updater,
                 },
-                banlist,
+                _banlist,
             ) = {
                 let quic_server_params = QuicStreamerConfig {
                     num_threads: NonZeroUsize::new(4.min(num_cpus::get())).unwrap(),
@@ -306,7 +375,7 @@ impl Tvu {
 
             // sigverifier
             let sharable_banks = bank_forks.read().unwrap().sharable_banks();
-            let bls_sigverifier_t = bls_sigverifier::spawn_service(
+            let bls_sigverify_t = bls_sigverifier::spawn_service(
                 exit.clone(),
                 SigVerifierContext {
                     migration_status: migration_status.clone(),
@@ -328,12 +397,32 @@ impl Tvu {
             let mut key_notifiers = key_notifiers.write().unwrap();
             key_notifiers.add(KeyUpdaterType::Bls, bls_key_updater);
 
-            Some((bls_streamer_t, bls_sigverifier_t))
+            Some((bls_streamer_t, bls_sigverify_t))
         } else {
             None
         };
 
         let (fetch_sender, fetch_receiver) = EvictingSender::new_bounded(SHRED_FETCH_CHANNEL_SIZE);
+
+        // Create fetch stage arrival tracing if enabled
+        let (fetch_stage_tracer, fetch_stage_arrival_csv_writer) =
+            if tvu_config.shred_arrival_tracing_enabled {
+                let (sender, writer) =
+                    create_fetch_stage_tracer(tvu_config.shred_arrival_output_dir.clone());
+                (Some(sender), Some(writer))
+            } else {
+                (None, None)
+            };
+
+        // Create window service event tracing if enabled
+        let (window_service_tracer, window_service_event_csv_writer) =
+            if tvu_config.shred_arrival_tracing_enabled {
+                let (sender, writer) =
+                    create_window_service_tracer(tvu_config.shred_arrival_output_dir.clone());
+                (Some(sender), Some(writer))
+            } else {
+                (None, None)
+            };
 
         let repair_socket = Arc::new(repair_socket);
         let ancestor_hashes_socket = Arc::new(ancestor_hashes_socket);
@@ -341,6 +430,7 @@ impl Tvu {
         let fetch_stage = ShredFetchStage::new(
             fetch_sockets,
             repair_response_quic_receiver,
+            turbine_quic_endpoint_receiver,
             repair_socket.clone(),
             fetch_sender,
             tvu_config.shred_version,
@@ -349,22 +439,163 @@ impl Tvu {
             outstanding_repair_requests.clone(),
             turbine_disabled,
             exit.clone(),
+            tvu_config.trusted_shred_publishers,
+            fetch_stage_tracer,
         );
 
         let (verified_sender, verified_receiver) = unbounded();
 
-        let (retransmit_sender, retransmit_receiver) =
-            EvictingSender::new_bounded(CHANNEL_SIZE_RETRANSMIT_INGRESS);
+        // Create shred arrival tracing components if enabled
+        let (shred_arrival_buffer, shred_arrival_csv_writer) =
+            if tvu_config.shred_arrival_tracing_enabled {
+                let (tx, rx) = crossbeam_channel::bounded(1000);
+                let buffer = Arc::new(ShredArrivalBuffer::new(tx));
+                let writer =
+                    ShredArrivalCsvWriter::spawn(tvu_config.shred_arrival_output_dir.clone(), rx);
+                (Some(buffer), Some(writer))
+            } else {
+                (None, None)
+            };
+
+        // Create dataset tracking components if shred arrival tracing is enabled
+        let (dataset_signature_sender, dataset_signature_csv_writer) = if tvu_config
+            .shred_arrival_tracing_enabled
+        {
+            let (tx, rx) = crossbeam_channel::bounded(1000);
+            let sender = Arc::new(DatasetSignatureSender::new(tx));
+            let writer = DatasetSignatureCsvWriter::spawn(
+                tvu_config.shred_arrival_output_dir.clone(),
+                "dataset_signatures".into(),
+                rx,
+            );
+            (Some(sender), Some(writer))
+        } else {
+            (None, None)
+        };
+
+        let (dataset_execution_sender, dataset_execution_csv_writer) = if tvu_config
+            .shred_arrival_tracing_enabled
+        {
+            let (tx, rx) = crossbeam_channel::bounded(1000);
+            let sender = Arc::new(DatasetExecutionSender::new(tx));
+            let writer =
+                DatasetExecutionCsvWriter::spawn(tvu_config.shred_arrival_output_dir.clone(), rx);
+            (Some(sender), Some(writer))
+        } else {
+            (None, None)
+        };
+
+        let (tick_tracking_sender, tick_tracking_csv_writer) =
+            if tvu_config.shred_arrival_tracing_enabled {
+                let (tx, rx) = crossbeam_channel::bounded(1000);
+                let sender = Arc::new(TickTrackingSender::new(tx));
+                let writer = TickTrackingCsvWriter::spawn(
+                    tvu_config.shred_arrival_output_dir.clone(),
+                    "ticks".into(),
+                    rx,
+                );
+                (Some(sender), Some(writer))
+            } else {
+                (None, None)
+            };
+
+        let (replay_batch_sender, replay_batch_csv_writer) =
+            if tvu_config.shred_arrival_tracing_enabled {
+                let (tx, rx) = crossbeam_channel::bounded(1000);
+                let sender = Arc::new(ReplayBatchSender::new(tx));
+                let writer = ReplayBatchCsvWriter::spawn(
+                    tvu_config.shred_arrival_output_dir.clone(),
+                    "replay_batches".into(),
+                    rx,
+                );
+                (Some(sender), Some(writer))
+            } else {
+                (None, None)
+            };
+
+        // Create blockstore insert phase tracking if enabled
+        let blockstore_insert_phase_csv_writer = if tvu_config.shred_arrival_tracing_enabled {
+            let (tx, rx) = crossbeam_channel::bounded(10000);
+            let sender = BlockstoreInsertPhaseSender::new(tx);
+            blockstore.set_insert_phase_sender(sender);
+            let writer = BlockstoreInsertPhaseCsvWriter::spawn(
+                tvu_config.shred_arrival_output_dir.clone(),
+                "blockstore_insert_phases".into(),
+                rx,
+            );
+            Some(writer)
+        } else {
+            None
+        };
+
+        // Create per-shred insert tracking if enabled
+        let shred_insert_csv_writer = if tvu_config.shred_arrival_tracing_enabled {
+            let (tx, rx) = crossbeam_channel::bounded(100000); // Larger buffer for per-shred records
+            let sender = ShredInsertSender::new(tx);
+            blockstore.set_shred_insert_sender(sender);
+            let writer = ShredInsertCsvWriter::spawn(
+                tvu_config.shred_arrival_output_dir.clone(),
+                "shred_inserts".into(),
+                rx,
+            );
+            Some(writer)
+        } else {
+            None
+        };
+
+        // Use pre-created tx execution tracking channel from TvuConfig (shared with scheduler pool)
+        // or create a new one if tracing is enabled but no pre-created sender was provided.
+        let (tx_execution_sender, tx_execution_csv_writer) =
+            if let (Some(sender), Some(rx)) = (
+                tvu_config.tx_execution_sender.clone(),
+                tvu_config.tx_execution_receiver,
+            ) {
+                let writer = TxExecutionCsvWriter::spawn(
+                    tvu_config.shred_arrival_output_dir.clone(),
+                    "tx_execution".into(),
+                    rx,
+                );
+                (Some(sender), Some(writer))
+            } else if tvu_config.shred_arrival_tracing_enabled
+                && tvu_config.tx_execution_sender.is_none()
+            {
+                // Fallback: create our own channel if tracing is enabled but no
+                // pre-created sender was provided (e.g. for tests)
+                let (tx, rx) =
+                    crossbeam_channel::bounded(100000);
+                let sender = Arc::new(TxExecutionSender::new(tx));
+                let writer = TxExecutionCsvWriter::spawn(
+                    tvu_config.shred_arrival_output_dir.clone(),
+                    "tx_execution".into(),
+                    rx,
+                );
+                (Some(sender), Some(writer))
+            } else {
+                (None, None)
+            };
+
+        let (tx_cost_priority_sender, tx_cost_priority_csv_writer) =
+            if tvu_config.shred_arrival_tracing_enabled {
+                let (tx, rx) = crossbeam_channel::bounded(100_000);
+                let sender = Arc::new(TxCostPrioritySender::new(tx));
+                let writer = TxCostPriorityCsvWriter::spawn(
+                    tvu_config.shred_arrival_output_dir.clone(),
+                    "tx_cost_priority".into(),
+                    rx,
+                );
+                (Some(sender), Some(writer))
+            } else {
+                (None, None)
+            };
 
         let shred_sigverify = solana_turbine::sigverify_shreds::spawn_shred_sigverify(
-            cluster_info.clone(),
-            bank_forks.clone(),
-            leader_schedule_cache.clone(),
             fetch_receiver,
-            retransmit_sender.clone(),
             verified_sender,
             tvu_config.shred_sigverify_threads,
         );
+
+        // Create retransmit channel (currently unused as sigverify doesn't populate it)
+        let (_retransmit_sender, retransmit_receiver) = unbounded();
 
         let retransmit_stage = RetransmitStage::new(
             bank_forks.clone(),
@@ -385,6 +616,8 @@ impl Tvu {
             unbounded();
         let (dumped_slots_sender, dumped_slots_receiver) = unbounded();
         let (popular_pruned_forks_sender, popular_pruned_forks_receiver) = unbounded();
+        // Latency tracking channel for measuring slot pipeline latency
+        let (latency_event_sender, latency_event_receiver) = create_latency_channel();
         let window_service = {
             let epoch_schedule = bank_forks
                 .read()
@@ -412,10 +645,14 @@ impl Tvu {
             );
             let window_service_channels = WindowServiceChannels::new(
                 verified_receiver,
-                retransmit_sender,
                 completed_data_sets_sender,
                 duplicate_slots_sender.clone(),
                 repair_service_channels,
+                Some(latency_event_sender.clone()),
+                tvu_config.entry_cache.clone(),
+                shred_arrival_buffer,
+                dataset_signature_sender,
+                window_service_tracer,
             );
             WindowService::new(
                 blockstore.clone(),
@@ -453,8 +690,8 @@ impl Tvu {
 
         // TODO: when the block component processor is upstreamed,
         // it will use the unused channels below.
-        let (reward_certs_sender, reward_certs_receiver) = bounded(MAX_ALPENGLOW_PACKET_NUM);
-        let (build_reward_certs_sender, build_reward_certs_receiver) =
+        let (reward_certs_sender, _reward_certs_receiver) = bounded(MAX_ALPENGLOW_PACKET_NUM);
+        let (_build_reward_certs_receiver, build_reward_certs_receiver) =
             bounded(MAX_ALPENGLOW_PACKET_NUM);
         let votor_config = VotorConfig {
             exit: exit.clone(),
@@ -516,6 +753,8 @@ impl Tvu {
             duplicate_confirmed_slots_receiver,
             gossip_verified_vote_hash_receiver,
             popular_pruned_forks_receiver,
+            latency_event_sender: Some(latency_event_sender),
+            latency_event_receiver: Some(latency_event_receiver),
         };
 
         let replay_stage_config = ReplayStageConfig {
@@ -541,6 +780,15 @@ impl Tvu {
             prioritization_fee_cache,
             banking_tracer,
             snapshot_controller,
+            deferred_signature_verification: tvu_config.deferred_signature_verification,
+            deferred_poh_verification: tvu_config.deferred_poh_verification,
+            prefetch_accounts: tvu_config.prefetch_accounts,
+            entry_cache: tvu_config.entry_cache.clone(),
+            dataset_execution_sender: dataset_execution_sender.clone(),
+            tick_tracking_sender: tick_tracking_sender.clone(),
+            replay_batch_sender: replay_batch_sender.clone(),
+            tx_execution_sender: tx_execution_sender.clone(),
+            tx_cost_priority_sender: tx_cost_priority_sender.clone(),
             replay_highest_frozen,
             migration_status,
         };
@@ -595,7 +843,6 @@ impl Tvu {
         Ok(Tvu {
             fetch_stage,
             shred_sigverify,
-            retransmit_stage,
             window_service,
             cluster_slots_service,
             replay_stage,
@@ -606,21 +853,24 @@ impl Tvu {
             warm_quic_cache_service,
             drop_bank_service,
             duplicate_shred_listener,
+            shred_arrival_csv_writer,
+            dataset_signature_csv_writer,
+            dataset_execution_csv_writer,
+            tick_tracking_csv_writer,
+            replay_batch_csv_writer,
+            blockstore_insert_phase_csv_writer,
+            shred_insert_csv_writer,
+            fetch_stage_arrival_csv_writer,
+            window_service_event_csv_writer,
+            tx_execution_csv_writer,
+            tx_cost_priority_csv_writer,
             bls_sigverify_threads,
             votor,
             commitment_service,
-            // TODO: these two channels are here temporarily and will be removed when the block
-            // component processor is upstreamed from the Alpenglow repo which will consume them.
-            // We need some place to store them temporarily so that they are not dropped.
-            // Dropping them causes interacting with the other ends in the BlsSigverifier to fail
-            // which causes the sigverifier to exit which resulting in various tests to fail.
-            reward_certs_receiver,
-            build_reward_certs_sender,
         })
     }
 
     pub fn join(self) -> thread::Result<()> {
-        self.retransmit_stage.join()?;
         self.window_service.join()?;
         self.cluster_slots_service.join()?;
         self.fetch_stage.join()?;
@@ -637,6 +887,36 @@ impl Tvu {
         }
         self.drop_bank_service.join()?;
         self.duplicate_shred_listener.join()?;
+        if let Some(csv_writer) = self.shred_arrival_csv_writer {
+            csv_writer.join();
+        }
+        if let Some(csv_writer) = self.dataset_signature_csv_writer {
+            csv_writer.join();
+        }
+        if let Some(csv_writer) = self.dataset_execution_csv_writer {
+            csv_writer.join();
+        }
+        if let Some(csv_writer) = self.tick_tracking_csv_writer {
+            csv_writer.join();
+        }
+        if let Some(csv_writer) = self.replay_batch_csv_writer {
+            csv_writer.join();
+        }
+        if let Some(csv_writer) = self.blockstore_insert_phase_csv_writer {
+            csv_writer.join();
+        }
+        if let Some(csv_writer) = self.fetch_stage_arrival_csv_writer {
+            csv_writer.join();
+        }
+        if let Some(csv_writer) = self.window_service_event_csv_writer {
+            csv_writer.join();
+        }
+        if let Some(csv_writer) = self.tx_execution_csv_writer {
+            csv_writer.join();
+        }
+        if let Some(csv_writer) = self.tx_cost_priority_csv_writer {
+            csv_writer.join();
+        }
         if let Some((streamer, sigverifier)) = self.bls_sigverify_threads {
             streamer.join()?;
             sigverifier.join()?;
@@ -717,6 +997,7 @@ pub mod tests {
         let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
 
         let (_, repair_response_quic_receiver) = unbounded();
+        let (_, turbine_quic_endpoint_receiver) = unbounded();
         let repair_quic_async_senders = RepairQuicAsyncSenders::new_dummy();
         let (_, ancestor_hashes_response_quic_receiver) = unbounded();
         //start cluster_info1
@@ -842,6 +1123,7 @@ pub mod tests {
             None, // prioritization_fee_cache
             BankingTracer::new_disabled(),
             repair_response_quic_receiver,
+            turbine_quic_endpoint_receiver,
             repair_quic_async_senders.repair_request_quic_sender,
             repair_quic_async_senders.ancestor_hashes_request_quic_sender,
             ancestor_hashes_response_quic_receiver,

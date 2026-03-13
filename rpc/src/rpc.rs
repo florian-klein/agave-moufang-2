@@ -3857,7 +3857,7 @@ pub mod rpc_full {
                 // malicious packing of the retry queue. Durable-nonce transactions are otherwise
                 // retried until the nonce is advanced.
                 last_valid_block_height =
-                    preflight_bank.block_height() + preflight_bank.max_processing_age() as u64;
+                    preflight_bank.block_height() + solana_clock::MAX_PROCESSING_AGE as u64;
             }
 
             if !skip_preflight {

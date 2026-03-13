@@ -40,6 +40,16 @@ pub struct BlockstoreInsertionMetrics {
     pub num_coding_shreds_invalid: usize,
     pub num_coding_shreds_invalid_erasure_config: usize,
     pub num_coding_shreds_inserted: usize,
+    pub data_shred_elapsed_us: u64,
+    pub code_shred_elapsed_us: u64,
+    pub max_data_shred_us: u64,
+    pub max_code_shred_us: u64,
+    pub num_data_shreds: u64,
+    pub num_code_shreds: u64,
+    // Sub-phase timings (cumulative across all shreds in batch)
+    pub meta_lookup_us: u64,
+    pub cache_insert_us: u64,
+    pub erasure_lookup_us: u64,
 }
 
 impl BlockstoreInsertionMetrics {

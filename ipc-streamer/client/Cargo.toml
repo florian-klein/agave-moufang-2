@@ -1,0 +1,13 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+shm_accounts_shared = { path = "../shared" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+libc = "0.2"
+solana-pubkey = "2.4.0"
+gxhash = "3.5.0"
+dashmap = "6.1.0"

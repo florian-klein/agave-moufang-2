@@ -27,6 +27,39 @@ use {
 
 thread_local! {
     pub static MEMORY_POOL: RefCell<VmMemoryPool> = RefCell::new(VmMemoryPool::new());
+    static PARAM_BUFFER_POOL: RefCell<Option<serialization::PooledAlignedBuffer>> = const { RefCell::new(None) };
+    static REGIONS_POOL: RefCell<Option<Vec<MemoryRegion>>> = const { RefCell::new(None) };
+    static ACCT_METADATA_POOL: RefCell<Option<Vec<SerializedAccountMetadata>>> = const { RefCell::new(None) };
+}
+
+fn take_param_buffer() -> Option<serialization::PooledAlignedBuffer> {
+    PARAM_BUFFER_POOL.with_borrow_mut(|pool| pool.take())
+}
+
+fn return_param_buffer(buf: serialization::PooledAlignedBuffer) {
+    PARAM_BUFFER_POOL.with_borrow_mut(|pool| {
+        *pool = Some(buf);
+    });
+}
+
+fn take_regions_vec() -> Option<Vec<MemoryRegion>> {
+    REGIONS_POOL.with_borrow_mut(|pool| pool.take())
+}
+
+fn return_regions_vec(v: Vec<MemoryRegion>) {
+    REGIONS_POOL.with_borrow_mut(|pool| {
+        *pool = Some(v);
+    });
+}
+
+fn take_acct_metadata_vec() -> Option<Vec<SerializedAccountMetadata>> {
+    ACCT_METADATA_POOL.with_borrow_mut(|pool| pool.take())
+}
+
+fn return_acct_metadata_vec(v: Vec<SerializedAccountMetadata>) {
+    ACCT_METADATA_POOL.with_borrow_mut(|pool| {
+        *pool = Some(v);
+    });
 }
 
 /// Only used in macro, do not use directly!
@@ -83,14 +116,17 @@ fn create_memory_mapping<'a, C: ContextObject>(
     executable: &Executable<C>,
     stack: &'a mut [u8],
     heap: &'a mut [u8],
-    additional_regions: Vec<MemoryRegion>,
+    mut additional_regions: Vec<MemoryRegion>,
     transaction_context: &TransactionContext,
     virtual_address_space_adjustments: bool,
     account_data_direct_mapping: bool,
 ) -> Result<MemoryMapping, Box<dyn std::error::Error>> {
     let config = executable.get_config();
     let sbpf_version = executable.get_sbpf_version();
-    let regions: Vec<MemoryRegion> = vec![
+
+    // Reuse the incoming Vec by prepending the 3 fixed regions.
+    // This avoids allocating a second Vec via chain().collect().
+    let fixed_regions = [
         executable.get_ro_region(),
         MemoryRegion::new_writable_gapped(
             stack,
@@ -102,13 +138,13 @@ fn create_memory_mapping<'a, C: ContextObject>(
             },
         ),
         MemoryRegion::new_writable(heap, MM_HEAP_START),
-    ]
-    .into_iter()
-    .chain(additional_regions)
-    .collect();
+    ];
+    additional_regions.reserve(3);
+    // Insert at front: splice replaces range 0..0 with the 3 items
+    additional_regions.splice(0..0, fixed_regions);
 
     Ok(MemoryMapping::new_with_access_violation_handler(
-        regions,
+        additional_regions,
         config,
         sbpf_version,
         transaction_context.access_violation_handler(
@@ -170,6 +206,31 @@ pub fn execute<'a, 'b: 'a>(
     let program_id = *instruction_context.get_program_key()?;
     let is_loader_deprecated =
         instruction_context.get_program_owner()? == bpf_loader_deprecated::id();
+    #[cfg_attr(feature = "sbpf-debugger", expect(unused_assignments))]
+    let mut execution_mode = ExecutionMode::PreferJit;
+    #[cfg(feature = "sbpf-debugger")]
+    let (debug_port, debug_metadata) = {
+        execution_mode = ExecutionMode::Interpreted;
+        (
+            invoke_context.debug_port,
+            format!(
+                "program_id={};cpi_level={};caller={}",
+                program_id,
+                instruction_context.get_stack_height().saturating_sub(1),
+                invoke_context
+                    .get_stack_height()
+                    .checked_sub(2)
+                    .and_then(|nesting_level| {
+                        transaction_context
+                            .get_instruction_context_at_nesting_level(nesting_level)
+                            .ok()
+                    })
+                    .and_then(|ctx| ctx.get_program_key().ok())
+                    .map(|key| key.to_string())
+                    .unwrap_or_else(|| "none".into())
+            ),
+        )
+    };
     let virtual_address_space_adjustments = invoke_context
         .get_feature_set()
         .virtual_address_space_adjustments;
@@ -182,12 +243,17 @@ pub fn execute<'a, 'b: 'a>(
         .direct_account_pointers_in_program_input;
 
     let mut serialize_time = Measure::start("serialize");
+    let pooled_buffer = take_param_buffer();
+    let pooled_regions = take_regions_vec();
+    let pooled_acct_metadata = take_acct_metadata_vec();
     let (parameter_bytes, regions, accounts_metadata, instruction_data_offset) =
-        serialization::serialize_parameters(
+        serialization::serialize_parameters_with_buffer(
             &instruction_context,
             virtual_address_space_adjustments,
             account_data_direct_mapping,
-            direct_account_pointers_in_program_input,
+            pooled_buffer,
+            pooled_regions,
+            pooled_acct_metadata,
         )?;
     serialize_time.stop();
 
@@ -210,32 +276,6 @@ pub fn execute<'a, 'b: 'a>(
 
     let mut create_vm_time = Measure::start("create_vm");
     let execution_result = {
-        #[cfg_attr(feature = "sbpf-debugger", expect(unused_assignments))]
-        let mut execution_mode = ExecutionMode::PreferJit;
-        #[cfg(feature = "sbpf-debugger")]
-        let (debug_port, debug_metadata) = {
-            execution_mode = ExecutionMode::Interpreted;
-            (
-                invoke_context.debug_port,
-                format!(
-                    "program_id={};cpi_level={};caller={}",
-                    program_id,
-                    instruction_context.get_stack_height().saturating_sub(1),
-                    invoke_context
-                        .get_stack_height()
-                        .checked_sub(2)
-                        .and_then(|nesting_level| {
-                            transaction_context
-                                .get_instruction_context_at_nesting_level(nesting_level)
-                                .ok()
-                        })
-                        .and_then(|ctx| ctx.get_program_key().ok())
-                        .map(|key| key.to_string())
-                        .unwrap_or_else(|| "none".into())
-                ),
-            )
-        };
-
         let compute_meter_prev = invoke_context.get_remaining();
         create_vm!(vm, executable, regions, accounts_metadata, invoke_context);
         let (mut vm, stack, heap) = match vm {
@@ -246,6 +286,7 @@ pub fn execute<'a, 'b: 'a>(
             }
         };
         create_vm_time.stop();
+
         #[cfg(feature = "sbpf-debugger")]
         {
             vm.debug_port = debug_port;
@@ -416,6 +457,18 @@ pub fn execute<'a, 'b: 'a>(
     invoke_context.timings.serialize_us += serialize_time.as_us();
     invoke_context.timings.create_vm_us += create_vm_time.as_us();
     invoke_context.timings.deserialize_us += deserialize_time.as_us();
+
+    // Return the parameter buffer to the thread-local pool for reuse
+    return_param_buffer(parameter_bytes);
+
+    // Return the accounts_metadata Vec to the pool for reuse.
+    // After deserialization, the Vec is no longer needed. Extract it from
+    // SyscallContext before it gets dropped by the caller's pop().
+    if let Ok(syscall_ctx) = invoke_context.get_syscall_context_mut() {
+        let mut metadata_vec = mem::take(&mut syscall_ctx.accounts_metadata);
+        metadata_vec.clear();
+        return_acct_metadata_vec(metadata_vec);
+    }
 
     execute_or_deserialize_result
 }

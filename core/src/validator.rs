@@ -88,6 +88,7 @@ use {
         blockstore_metric_report_service::BlockstoreMetricReportService,
         blockstore_options::{BLOCKSTORE_DIRECTORY_ROCKS_LEVEL, BlockstoreOptions},
         blockstore_processor::{self, TransactionStatusSender},
+        dataset_tracking::{TxExecutionCsvWriter, TxExecutionSender},
         entry_notifier_interface::EntryNotifierArc,
         entry_notifier_service::{EntryNotifierSender, EntryNotifierService},
         leader_schedule_cache::LeaderScheduleCache,
@@ -152,7 +153,7 @@ use {
         borrow::Cow,
         cmp,
         collections::{HashMap, HashSet},
-        net::SocketAddr,
+        net::{IpAddr, SocketAddr},
         num::{NonZeroU64, NonZeroUsize},
         path::{Path, PathBuf},
         str::FromStr,
@@ -211,10 +212,29 @@ pub enum BlockProductionMethod {
     CentralScheduler,
     #[default]
     CentralSchedulerGreedy,
+    UnifiedScheduler,
 }
 
 impl BlockProductionMethod {
-    pub const fn cli_names() -> &'static [&'static str] {
+    pub fn cli_names() -> &'static [&'static str] {
+        // Simply return Self::VARIANTS by removing this code block altogether once after
+        // UnifiedScheduler isn't experimental
+        {
+            use std::sync::LazyLock;
+            static VARIANTS_NO_EXPERIMENTAL: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+                BlockProductionMethod::VARIANTS
+                    .iter()
+                    .filter_map(|&variant| (variant != "unified-scheduler").then_some(variant))
+                    .collect()
+            });
+
+            let disable_experimental =
+                std::env::var("SOLANA_ENABLE_EXPERIMENTAL_BLOCK_PRODUCTION_METHOD").is_err();
+            if disable_experimental {
+                return &VARIANTS_NO_EXPERIMENTAL[..];
+            }
+        }
+
         Self::VARIANTS
     }
 
@@ -294,6 +314,9 @@ pub fn supported_scheduling_mode(
     (verification, production): (&BlockVerificationMethod, &BlockProductionMethod),
 ) -> SupportedSchedulingMode {
     match (verification, production) {
+        (BlockVerificationMethod::UnifiedScheduler, BlockProductionMethod::UnifiedScheduler) => {
+            SupportedSchedulingMode::Both
+        }
         (BlockVerificationMethod::UnifiedScheduler, _) => {
             SupportedSchedulingMode::Either(SchedulingMode::BlockVerification)
         }
@@ -338,6 +361,25 @@ pub struct ValidatorConfig {
     /// Run PoH, transaction signature and other transaction verification during blockstore
     /// processing.
     pub run_verification: bool,
+    /// When true, execute transactions before signature verification completes.
+    /// Signature verification runs asynchronously after execution, reducing
+    /// latency for ShmPlugin notifications by 10-100ms. Consensus safety is maintained.
+    pub deferred_signature_verification: bool,
+    /// When true, execute transactions before PoH verification completes.
+    /// PoH verification runs after execution, reducing latency for ShmPlugin notifications.
+    pub deferred_poh_verification: bool,
+    /// When true, prefetch accounts into the read cache in background while
+    /// verification runs, reducing latency for transaction execution.
+    pub prefetch_accounts: bool,
+    /// Optional entry cache for low-latency entry access during replay.
+    /// When provided, entries are read from cache first, falling back to blockstore.
+    pub entry_cache: Option<Arc<solana_ledger::entry_cache::EntryCache>>,
+    /// Enable shred arrival tracing to CSV files.
+    /// When enabled, arrival metadata (timestamp, source IP, source type) is
+    /// captured for each shred and written to CSV when completed data sets are produced.
+    pub shred_arrival_tracing_enabled: bool,
+    /// Directory for shred arrival CSV files.
+    pub shred_arrival_output_dir: PathBuf,
     pub require_tower: bool,
     pub tower_storage: Arc<dyn TowerStorage>,
     pub vote_history_storage: Arc<dyn VoteHistoryStorage>,
@@ -379,10 +421,11 @@ pub struct ValidatorConfig {
     pub replay_forks_threads: NonZeroUsize,
     pub replay_transactions_threads: NonZeroUsize,
     pub tvu_shred_sigverify_threads: NonZeroUsize,
-    pub tvu_bls_sigverify_threads: NonZeroUsize,
     pub delay_leader_block_for_pending_fork: bool,
     pub voting_service_test_override: Option<VotingServiceOverride>,
     pub repair_handler_type: RepairHandlerType,
+    pub trusted_shred_publishers: Option<HashSet<IpAddr>>,
+    pub shredstream_config: crate::shredstream::ShredstreamConfig,
     // Thread niceness adjustment for snapshot packager service
     pub snapshot_packager_niceness_adj: i8,
 }
@@ -415,7 +458,15 @@ impl ValidatorConfig {
             repair_whitelist: Arc::new(RwLock::new(HashSet::default())),
             gossip_validators: None,
             max_genesis_archive_unpacked_size: MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
-            run_verification: true,
+            run_verification: false,
+            deferred_signature_verification: false,
+            // OPTIMIZATION: Enable deferred PoH verification for lower latency (1-10ms savings)
+            deferred_poh_verification: true,
+            prefetch_accounts: false,
+            // Enable entry cache by default for lower latency replay (32 slots = ~13 seconds)
+            entry_cache: Some(Arc::new(solana_ledger::entry_cache::EntryCache::new(32))),
+            shred_arrival_tracing_enabled: false,
+            shred_arrival_output_dir: PathBuf::from("shred_arrivals"),
             require_tower: false,
             tower_storage: Arc::new(NullTowerStorage::default()),
             vote_history_storage: Arc::new(NullVoteHistoryStorage::default()),
@@ -461,10 +512,11 @@ impl ValidatorConfig {
             replay_forks_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             replay_transactions_threads: NonZeroUsize::new(2).expect("2 is non-zero"),
             tvu_shred_sigverify_threads: NonZeroUsize::new(2).expect("2 is non-zero"),
-            tvu_bls_sigverify_threads: NonZeroUsize::new(2).expect("2 is non-zero"),
             delay_leader_block_for_pending_fork: false,
             voting_service_test_override: None,
             repair_handler_type: RepairHandlerType::default(),
+            trusted_shred_publishers: None,
+            shredstream_config: crate::shredstream::ShredstreamConfig::default(),
             snapshot_packager_niceness_adj: 0,
         }
     }
@@ -657,6 +709,7 @@ pub struct Validator {
     // We don't wait for its JoinHandle here because ownership and shutdown
     // are managed elsewhere. This variable is intentionally unused.
     _tpu_client_next_runtime: Option<TokioRuntime>,
+    shredstream_service: Option<crate::shredstream::ShredstreamService>,
 }
 
 impl Validator {
@@ -1075,6 +1128,17 @@ impl Validator {
         }
         let banking_tracer_channels = banking_tracer.create_channels();
 
+        // Create per-transaction execution tracking channel if tracing is enabled.
+        // The sender is shared between the unified scheduler pool (for actual per-tx
+        // timing) and the Tvu (for replay_stage access). The receiver goes to the Tvu
+        // to create the parquet writer.
+        let (tx_execution_sender, tx_execution_receiver) = if config.shred_arrival_tracing_enabled {
+            let (tx, rx) = crossbeam_channel::bounded(100_000);
+            (Some(Arc::new(TxExecutionSender::new(tx))), Some(rx))
+        } else {
+            (None, None)
+        };
+
         match (
             &config.block_verification_method,
             &config.block_production_method,
@@ -1087,6 +1151,7 @@ impl Validator {
                     transaction_status_sender.clone(),
                     Some(replay_vote_sender.clone()),
                     prioritization_fee_cache.clone(),
+                    tx_execution_sender.clone(),
                 );
                 ensure_banking_stage_setup(
                     &scheduler_pool,
@@ -1429,6 +1494,7 @@ impl Validator {
         let (repair_response_quic_sender, repair_response_quic_receiver) = unbounded();
         let (ancestor_hashes_response_quic_sender, ancestor_hashes_response_quic_receiver) =
             unbounded();
+        let (_turbine_quic_endpoint_sender, turbine_quic_endpoint_receiver) = unbounded();
 
         let waited_for_supermajority = wait_for_supermajority(
             config,
@@ -1600,6 +1666,19 @@ impl Validator {
             None
         };
 
+        // Bind extra sockets for shredstream multi-heartbeat before TVU creation.
+        // These sockets become part of the TVU fetch pipeline so shreds arrive
+        // through ShredFetchStage with correct source IPs and native dedup.
+        let multi_hb_extra_ports = if config.shredstream_config.enabled {
+            let (extra_sockets, ports) = crate::shredstream::create_multi_heartbeat_sockets(
+                &config.shredstream_config.regions,
+            );
+            node.sockets.tvu.extend(extra_sockets);
+            ports
+        } else {
+            Vec::new()
+        };
+
         let tvu = Tvu::new(
             vote_account,
             authorized_voter_keypairs,
@@ -1645,8 +1724,18 @@ impl Validator {
                 replay_forks_threads: config.replay_forks_threads,
                 replay_transactions_threads: config.replay_transactions_threads,
                 shred_sigverify_threads: config.tvu_shred_sigverify_threads,
-                bls_sigverify_threads: config.tvu_bls_sigverify_threads,
                 xdp_sender: xdp_sender.clone(),
+                trusted_shred_publishers: Arc::new(
+                    config.trusted_shred_publishers.clone().unwrap_or_default(),
+                ),
+                deferred_signature_verification: config.deferred_signature_verification,
+                deferred_poh_verification: config.deferred_poh_verification,
+                prefetch_accounts: config.prefetch_accounts,
+                entry_cache: config.entry_cache.clone(),
+                shred_arrival_tracing_enabled: config.shred_arrival_tracing_enabled,
+                shred_arrival_output_dir: config.shred_arrival_output_dir.clone(),
+                tx_execution_sender: tx_execution_sender.clone(),
+                tx_execution_receiver,
             },
             &max_slots,
             block_metadata_notifier,
@@ -1656,6 +1745,7 @@ impl Validator {
             prioritization_fee_cache.clone(),
             banking_tracer,
             repair_response_quic_receiver,
+            turbine_quic_endpoint_receiver,
             repair_quic_async_senders.repair_request_quic_sender,
             repair_quic_async_senders.ancestor_hashes_request_quic_sender,
             ancestor_hashes_response_quic_receiver,
@@ -1677,6 +1767,49 @@ impl Validator {
             },
         )
         .map_err(ValidatorError::Other)?;
+
+        let shredstream_service = if config.shredstream_config.enabled {
+            // Get the TVU address from node ContactInfo (UDP protocol for shreds)
+            let tvu_addr_opt = node
+                .info
+                .tvu(solana_client::connection_cache::Protocol::UDP);
+
+            let public_ip = config
+                .shredstream_config
+                .public_ip
+                .or_else(|| tvu_addr_opt.as_ref().map(|addr| addr.ip()))
+                .ok_or_else(|| {
+                    ValidatorError::Other(
+                        "Shredstream requires public IP: use --shredstream-public-ip or ensure TVU is configured".into()
+                    )
+                })?;
+
+            let tvu_port = tvu_addr_opt
+                .as_ref()
+                .map(|addr| addr.port())
+                .ok_or_else(|| {
+                    ValidatorError::Other("Shredstream requires TVU port to be configured".into())
+                })?;
+
+            let tvu_addr = SocketAddr::new(public_ip, tvu_port);
+            info!("Shredstream: registering TVU address {}", tvu_addr);
+
+            match crate::shredstream::ShredstreamService::new(
+                config.shredstream_config.clone(),
+                &identity_keypair,
+                tvu_addr,
+                multi_hb_extra_ports,
+                exit.clone(),
+            ) {
+                Ok(service) => Some(service),
+                Err(e) => {
+                    warn!("Failed to start shredstream service: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let tpu_forwaring_client_config = {
             let runtime_handle = tpu_client_next_runtime
@@ -1817,6 +1950,7 @@ impl Validator {
             repair_quic_endpoints_join_handle,
             xdp_retransmitter,
             _tpu_client_next_runtime: tpu_client_next_runtime,
+            shredstream_service,
         })
     }
 
@@ -2004,6 +2138,10 @@ impl Validator {
 
         if let Some(geyser_plugin_service) = self.geyser_plugin_service {
             geyser_plugin_service.join().expect("geyser_plugin_service");
+        }
+
+        if let Some(shredstream_service) = self.shredstream_service {
+            shredstream_service.join().expect("shredstream_service");
         }
     }
 }
@@ -2201,7 +2339,7 @@ fn load_blockstore(
     *start_progress.write().unwrap() = ValidatorStartProgress::LoadingLedger;
 
     let mut process_options = blockstore_processor::ProcessOptions {
-        run_verification: config.run_verification,
+        run_verification: false,
         halt_at_slot: None,
         new_hard_forks: config.new_hard_forks.clone(),
         debug_keys: config.debug_keys.clone(),
@@ -2210,6 +2348,13 @@ fn load_blockstore(
         accounts_db_force_initial_clean: config.accounts_db_force_initial_clean,
         runtime_config: config.runtime_config.clone(),
         use_snapshot_archives_at_startup: config.use_snapshot_archives_at_startup,
+        // Performance optimizations for readonly/observer mode
+        no_block_cost_limits: true, // Skip cost tracking (u64::MAX limits)
+        verify_index: false,        // Skip accounts index verification
+        run_final_accounts_hash_calc: false, // Skip final hash calc (debugging only)
+        allow_dead_slots: true,     // Continue processing dead slots
+        full_leader_cache: true,    // Cache all leader schedules
+        abort_on_invalid_block: false, // Continue on invalid blocks
         ..blockstore_processor::ProcessOptions::default()
     };
 

@@ -139,6 +139,68 @@ impl RuntimeTransaction<SanitizedTransaction> {
     fn load_dynamic_metadata(&mut self) -> Result<()> {
         Ok(())
     }
+
+    /// Create a new `RuntimeTransaction<SanitizedTransaction>` with minimal processing.
+    /// Skips compute budget extraction.
+    /// NOTE: Message hash is still computed as it's required for deduplication.
+    /// NOTE: Precompile signature counting is still done as it's required for bank hash.
+    /// NOTE: Vote detection is still done as it affects cost tracking and scheduling.
+    pub fn try_create_simple(
+        tx: VersionedTransaction,
+        address_loader: impl AddressLoader,
+        reserved_account_keys: &HashSet<Pubkey>,
+    ) -> Result<Self> {
+        let sanitized_versioned_tx = SanitizedVersionedTransaction::try_from(tx)?;
+
+        // Message hash is required for deduplication - cannot skip this
+        let message_hash = sanitized_versioned_tx.get_message().message.hash();
+
+        // Vote detection is required for proper cost tracking and scheduling
+        let is_simple_vote_tx = is_simple_vote_transaction(&sanitized_versioned_tx);
+
+        // Must count precompile signatures - this affects bank hash computation!
+        let InstructionMeta {
+            precompile_signature_details,
+            instruction_data_len,
+        } = InstructionMeta::try_new(
+            sanitized_versioned_tx
+                .get_message()
+                .program_instructions_iter()
+                .map(|(program_id, ix)| (program_id, SVMInstruction::from(ix))),
+        )?;
+
+        let signature_details = TransactionSignatureDetails::new(
+            u64::from(
+                sanitized_versioned_tx
+                    .get_message()
+                    .message
+                    .header()
+                    .num_required_signatures,
+            ),
+            precompile_signature_details.num_secp256k1_instruction_signatures,
+            precompile_signature_details.num_ed25519_instruction_signatures,
+            precompile_signature_details.num_secp256r1_instruction_signatures,
+        );
+
+        let sanitized_transaction = SanitizedTransaction::try_new(
+            sanitized_versioned_tx,
+            message_hash,
+            is_simple_vote_tx,
+            address_loader,
+            reserved_account_keys,
+        )?;
+
+        Ok(Self {
+            transaction: sanitized_transaction,
+            meta: TransactionMeta {
+                message_hash,
+                is_simple_vote_transaction: is_simple_vote_tx,
+                signature_details,
+                compute_budget_instruction_details: ComputeBudgetInstructionDetails::default(),
+                instruction_data_len,
+            },
+        })
+    }
 }
 
 impl TransactionWithMeta for RuntimeTransaction<SanitizedTransaction> {

@@ -28,6 +28,8 @@ agave-unstable-api = []
 [dependencies]
 agave-feature-set = { workspace = true }
 agave-reserved-account-keys = { workspace = true }
+ahash = { workspace = true }
+arrow = { version = "54", default-features = false, features = ["prettyprint"] }
 agave-snapshots = { workspace = true }
 agave-votor-messages = { workspace = true }
 anyhow = { workspace = true }
@@ -45,11 +47,14 @@ fs_extra = { workspace = true }
 futures = { workspace = true }
 itertools = { workspace = true }
 lazy-lru = { workspace = true }
+libc = { workspace = true }
 log = { workspace = true }
 lru = { workspace = true }
 mockall = { workspace = true }
 num_cpus = { workspace = true }
 num_enum = { workspace = true }
+parking_lot = { workspace = true }
+parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
 prost = { workspace = true }
 qualifier_attr = { workspace = true }
 rand = { workspace = true }

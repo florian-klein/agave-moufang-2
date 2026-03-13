@@ -1,11 +1,15 @@
 use {
     crate::rent_calculator::{RentState, check_rent_state, get_account_rent_state},
+    smallvec::SmallVec,
     solana_account::ReadableAccount,
     solana_rent::Rent,
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction_context::{IndexOfAccount, transaction::TransactionContext},
     solana_transaction_error::TransactionResult as Result,
 };
+
+/// Most transactions have <= 32 accounts; use stack storage to avoid heap allocation.
+pub(crate) type AccountStateInfoVec = SmallVec<[TransactionAccountStateInfo; 32]>;
 
 #[derive(PartialEq, Debug)]
 pub(crate) struct TransactionAccountStateInfo {
@@ -17,7 +21,7 @@ impl TransactionAccountStateInfo {
         transaction_context: &TransactionContext,
         message: &impl SVMMessage,
         rent: &Rent,
-    ) -> Vec<Self> {
+    ) -> AccountStateInfoVec {
         (0..message.account_keys().len())
             .map(|i| {
                 let rent_state = if message.is_writable(i) {
@@ -121,8 +125,8 @@ mod test {
         let context = TransactionContext::new(transaction_accounts, rent.clone(), 20, 20, 1);
         let result = TransactionAccountStateInfo::new(&context, &sanitized_message, &rent);
         assert_eq!(
-            result,
-            vec![
+            result.as_slice(),
+            &[
                 TransactionAccountStateInfo {
                     rent_state: Some(RentState::Uninitialized)
                 },
