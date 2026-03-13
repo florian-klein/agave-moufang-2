@@ -115,27 +115,7 @@ impl VotingService {
         if let VoteOp::PushVote { saved_tower, .. } = &vote_op {
             let mut measure = Measure::start("tower storage save");
             if let Err(err) = tower_storage.store(saved_tower) {
-                datapoint_info!(
-                    "tower-storage-failure",
-                    ("error", format!("{:?}", err), String),
-                );
                 error!("Unable to save tower to storage: {err:?}");
-                let crash_msg = format!("FATAL: Unable to save tower to storage: {err:?}");
-                eprintln!("{crash_msg}");
-                let _ = std::io::Write::flush(&mut std::io::stderr());
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/var/solana/data/validator-crash.log")
-                {
-                    use std::io::Write;
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let _ = writeln!(f, "[{ts}] {crash_msg}");
-                    let _ = f.flush();
-                }
                 std::process::exit(1);
             }
             measure.stop();

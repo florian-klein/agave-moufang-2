@@ -23,10 +23,6 @@ pub fn verify_shred_cpu(
     slot_leaders: &SlotPubkeys,
     cache: &RwLock<LruCache>,
 ) -> bool {
-    // OPTIMIZATION: Skip leader signature verification for lower latency
-    if !packet.meta().discard() {
-        return true;
-    }
     if packet.meta().discard() {
         return false;
     }
@@ -47,10 +43,6 @@ pub fn verify_shred_cpu(
     let Some(data) = shred::layout::get_merkle_root(shred) else {
         return false;
     };
-
-    if (packet.meta().flags.bits() & 0x80) != 0 {
-        return true;
-    }
 
     let key = (signature, *pubkey, data);
     if cache.read().unwrap().get(&key).is_some() {

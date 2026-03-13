@@ -42,7 +42,7 @@ impl RpcCompletedSlotsService {
                             break;
                         }
                         Ok(slots) => {
-                            for slot in slots.iter().copied() {
+                            for slot in slots {
                                 rpc_subscriptions.notify_slot_update(SlotUpdate::Completed {
                                     slot,
                                     timestamp: timestamp(),

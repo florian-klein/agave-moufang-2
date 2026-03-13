@@ -517,39 +517,18 @@ pub fn set_panic_hook(program: &'static str, version: Option<String>) {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |ono| {
             default_hook(ono);
-            let thread_name = thread::current().name().unwrap_or("?").to_string();
             let location = match ono.location() {
                 Some(location) => location.to_string(),
                 None => "?".to_string(),
             };
-            let message = ono.to_string();
-            // Write directly to stderr and a crash log file to ensure visibility before process::exit
-            let crash_msg = format!(
-                "FATAL PANIC: thread '{thread_name}' panicked at {location}: {message}"
-            );
-            eprintln!("{crash_msg}");
-            let _ = std::io::Write::flush(&mut std::io::stderr());
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/var/solana/data/validator-crash.log")
-            {
-                use std::io::Write;
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let _ = writeln!(f, "[{ts}] {crash_msg}");
-                let _ = f.flush();
-            }
             submit(
                 DataPoint::new("panic")
                     .add_field_str("program", program)
-                    .add_field_str("thread", &thread_name)
+                    .add_field_str("thread", thread::current().name().unwrap_or("?"))
                     // The 'one' field exists to give Kapacitor Alerts a numerical value
                     // to filter on
                     .add_field_i64("one", 1)
-                    .add_field_str("message", &message)
+                    .add_field_str("message", &ono.to_string())
                     .add_field_str("location", &location)
                     .add_field_str("version", version.as_ref().unwrap_or(&"".to_string()))
                     .to_owned(),

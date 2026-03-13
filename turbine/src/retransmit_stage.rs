@@ -652,12 +652,12 @@ impl RetransmitStage {
         let mut rng = rand::rng();
         let mut stats = RetransmitStats::new(Instant::now());
         let mut addr_cache = AddrCache::with_capacity(/*capacity:*/ 4);
-        let mut shred_deduper = ShredDeduper::<2>::new(&mut rng, /*num_bits:*/ 640_007);
+        let mut shred_deduper = ShredDeduper::new(&mut rng, DEDUPER_NUM_BITS);
 
         let thread_pool = {
             let num_threads = retransmit_sockets.len();
             ThreadPoolBuilder::new()
-                .num_threads(1)
+                .num_threads(num_threads)
                 .thread_name(|i| format!("solRetransmit{i:02}"))
                 .build()
                 .unwrap()
