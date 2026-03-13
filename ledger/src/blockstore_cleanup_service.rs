@@ -211,7 +211,7 @@ impl BlockstoreCleanupService {
             Self::find_slots_to_clean(blockstore, root, max_ledger_shreds);
 
         if slots_to_clean {
-            *blockstore.lowest_cleanup_slot.write().unwrap() = lowest_cleanup_slot;
+            *blockstore.lowest_cleanup_slot.write() = lowest_cleanup_slot;
 
             let mut purge_time = Measure::start("purge_slots()");
             // purge any slots older than lowest_cleanup_slot.

@@ -288,16 +288,6 @@ pub struct ReplayStageConfig {
     pub prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
     pub banking_tracer: Arc<BankingTracer>,
     pub snapshot_controller: Option<Arc<SnapshotController>>,
-    /// When true, execute transactions before signature verification completes.
-    /// Signature verification runs asynchronously after execution, reducing
-    /// latency for ShmPlugin notifications by 10-100ms. Consensus safety is maintained.
-    pub deferred_signature_verification: bool,
-    /// When true, execute transactions before PoH verification completes.
-    /// PoH verification runs after execution, reducing latency for ShmPlugin notifications.
-    pub deferred_poh_verification: bool,
-    /// When true, prefetch accounts into the read cache in background while
-    /// verification runs, reducing latency for transaction execution.
-    pub prefetch_accounts: bool,
     /// Optional entry cache for low-latency entry access during replay.
     /// When provided, entries are read from cache first, falling back to blockstore.
     pub entry_cache: Option<Arc<solana_ledger::entry_cache::EntryCache>>,
@@ -638,9 +628,6 @@ impl ReplayStage {
             prioritization_fee_cache,
             banking_tracer,
             snapshot_controller,
-            deferred_signature_verification,
-            deferred_poh_verification,
-            prefetch_accounts,
             entry_cache,
             dataset_execution_sender,
             tx_execution_sender,
@@ -871,9 +858,6 @@ impl ReplayStage {
                     &mut purge_repair_slot_counter,
                     (!migration_status.is_alpenglow_enabled()).then_some(&mut tbft_structs),
                     &latency_event_sender,
-                    deferred_signature_verification,
-                    deferred_poh_verification,
-                    prefetch_accounts,
                     entry_cache.as_deref(),
                     dataset_execution_sender.as_deref(),
                     tick_tracking_sender.as_deref(),
@@ -2554,9 +2538,6 @@ impl ReplayStage {
         replay_vote_sender: &ReplayVoteSender,
         log_messages_bytes_limit: Option<usize>,
         prioritization_fee_cache: Option<&PrioritizationFeeCache>,
-        deferred_signature_verification: bool,
-        deferred_poh_verification: bool,
-        prefetch_accounts: bool,
         entry_cache: Option<&solana_ledger::entry_cache::EntryCache>,
         dataset_execution_sender: Option<&solana_ledger::dataset_tracking::DatasetExecutionSender>,
         tick_tracking_sender: Option<&solana_ledger::dataset_tracking::TickTrackingSender>,
@@ -2576,9 +2557,6 @@ impl ReplayStage {
             &mut w_replay_stats,
             &mut w_replay_progress,
             false,
-            deferred_signature_verification,
-            deferred_poh_verification,
-            prefetch_accounts,
             transaction_status_sender,
             entry_notification_sender,
             Some(replay_vote_sender),
@@ -3257,9 +3235,6 @@ impl ReplayStage {
         log_messages_bytes_limit: Option<usize>,
         active_bank_slots: &[Slot],
         prioritization_fee_cache: Option<&PrioritizationFeeCache>,
-        deferred_signature_verification: bool,
-        deferred_poh_verification: bool,
-        prefetch_accounts: bool,
         entry_cache: Option<&solana_ledger::entry_cache::EntryCache>,
         dataset_execution_sender: Option<&solana_ledger::dataset_tracking::DatasetExecutionSender>,
         tick_tracking_sender: Option<&solana_ledger::dataset_tracking::TickTrackingSender>,
@@ -3346,9 +3321,6 @@ impl ReplayStage {
                             &replay_vote_sender.clone(),
                             log_messages_bytes_limit,
                             prioritization_fee_cache,
-                            deferred_signature_verification,
-                            deferred_poh_verification,
-                            prefetch_accounts,
                             entry_cache,
                             dataset_execution_sender,
                             tick_tracking_sender,
@@ -3386,9 +3358,6 @@ impl ReplayStage {
         log_messages_bytes_limit: Option<usize>,
         bank_slot: Slot,
         prioritization_fee_cache: Option<&PrioritizationFeeCache>,
-        deferred_signature_verification: bool,
-        deferred_poh_verification: bool,
-        prefetch_accounts: bool,
         entry_cache: Option<&solana_ledger::entry_cache::EntryCache>,
         dataset_execution_sender: Option<&solana_ledger::dataset_tracking::DatasetExecutionSender>,
         tick_tracking_sender: Option<&solana_ledger::dataset_tracking::TickTrackingSender>,
@@ -3471,9 +3440,6 @@ impl ReplayStage {
                     &replay_vote_sender.clone(),
                     log_messages_bytes_limit,
                     prioritization_fee_cache,
-                    deferred_signature_verification,
-                    deferred_poh_verification,
-                    prefetch_accounts,
                     entry_cache,
                     dataset_execution_sender,
                     tick_tracking_sender,
@@ -3903,9 +3869,6 @@ impl ReplayStage {
         purge_repair_slot_counter: &mut PurgeRepairSlotCounter,
         tbft_structs: Option<&mut TowerBFTStructures>,
         latency_event_sender: &Option<LatencyEventSender>,
-        deferred_signature_verification: bool,
-        deferred_poh_verification: bool,
-        prefetch_accounts: bool,
         entry_cache: Option<&solana_ledger::entry_cache::EntryCache>,
         dataset_execution_sender: Option<&solana_ledger::dataset_tracking::DatasetExecutionSender>,
         tick_tracking_sender: Option<&solana_ledger::dataset_tracking::TickTrackingSender>,
@@ -3939,9 +3902,6 @@ impl ReplayStage {
                     log_messages_bytes_limit,
                     &active_bank_slots,
                     prioritization_fee_cache,
-                    deferred_signature_verification,
-                    deferred_poh_verification,
-                    prefetch_accounts,
                     entry_cache,
                     dataset_execution_sender,
                     tick_tracking_sender,
@@ -3966,9 +3926,6 @@ impl ReplayStage {
                         log_messages_bytes_limit,
                         *bank_slot,
                         prioritization_fee_cache,
-                        deferred_signature_verification,
-                        deferred_poh_verification,
-                        prefetch_accounts,
                         entry_cache,
                         dataset_execution_sender,
                         tick_tracking_sender,
@@ -5696,9 +5653,6 @@ pub(crate) mod tests {
                 &replay_vote_sender,
                 None,
                 Some(&PrioritizationFeeCache::new(0u64)),
-                false, // deferred_signature_verification
-                false, // deferred_poh_verification
-                false, // prefetch_accounts
                 None,  // entry_cache
                 None,  // dataset_execution_sender
                 None,  // tick_tracking_sender

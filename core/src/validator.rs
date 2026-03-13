@@ -153,7 +153,7 @@ use {
         borrow::Cow,
         cmp,
         collections::{HashMap, HashSet},
-        net::{IpAddr, SocketAddr},
+        net::SocketAddr,
         num::{NonZeroU64, NonZeroUsize},
         path::{Path, PathBuf},
         str::FromStr,
@@ -361,16 +361,6 @@ pub struct ValidatorConfig {
     /// Run PoH, transaction signature and other transaction verification during blockstore
     /// processing.
     pub run_verification: bool,
-    /// When true, execute transactions before signature verification completes.
-    /// Signature verification runs asynchronously after execution, reducing
-    /// latency for ShmPlugin notifications by 10-100ms. Consensus safety is maintained.
-    pub deferred_signature_verification: bool,
-    /// When true, execute transactions before PoH verification completes.
-    /// PoH verification runs after execution, reducing latency for ShmPlugin notifications.
-    pub deferred_poh_verification: bool,
-    /// When true, prefetch accounts into the read cache in background while
-    /// verification runs, reducing latency for transaction execution.
-    pub prefetch_accounts: bool,
     /// Optional entry cache for low-latency entry access during replay.
     /// When provided, entries are read from cache first, falling back to blockstore.
     pub entry_cache: Option<Arc<solana_ledger::entry_cache::EntryCache>>,
@@ -424,7 +414,6 @@ pub struct ValidatorConfig {
     pub delay_leader_block_for_pending_fork: bool,
     pub voting_service_test_override: Option<VotingServiceOverride>,
     pub repair_handler_type: RepairHandlerType,
-    pub trusted_shred_publishers: Option<HashSet<IpAddr>>,
     pub shredstream_config: crate::shredstream::ShredstreamConfig,
     // Thread niceness adjustment for snapshot packager service
     pub snapshot_packager_niceness_adj: i8,
@@ -459,10 +448,6 @@ impl ValidatorConfig {
             gossip_validators: None,
             max_genesis_archive_unpacked_size: MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
             run_verification: false,
-            deferred_signature_verification: false,
-            // OPTIMIZATION: Enable deferred PoH verification for lower latency (1-10ms savings)
-            deferred_poh_verification: true,
-            prefetch_accounts: false,
             // Enable entry cache by default for lower latency replay (32 slots = ~13 seconds)
             entry_cache: Some(Arc::new(solana_ledger::entry_cache::EntryCache::new(32))),
             shred_arrival_tracing_enabled: false,
@@ -515,7 +500,6 @@ impl ValidatorConfig {
             delay_leader_block_for_pending_fork: false,
             voting_service_test_override: None,
             repair_handler_type: RepairHandlerType::default(),
-            trusted_shred_publishers: None,
             shredstream_config: crate::shredstream::ShredstreamConfig::default(),
             snapshot_packager_niceness_adj: 0,
         }
@@ -1725,12 +1709,6 @@ impl Validator {
                 replay_transactions_threads: config.replay_transactions_threads,
                 shred_sigverify_threads: config.tvu_shred_sigverify_threads,
                 xdp_sender: xdp_sender.clone(),
-                trusted_shred_publishers: Arc::new(
-                    config.trusted_shred_publishers.clone().unwrap_or_default(),
-                ),
-                deferred_signature_verification: config.deferred_signature_verification,
-                deferred_poh_verification: config.deferred_poh_verification,
-                prefetch_accounts: config.prefetch_accounts,
                 entry_cache: config.entry_cache.clone(),
                 shred_arrival_tracing_enabled: config.shred_arrival_tracing_enabled,
                 shred_arrival_output_dir: config.shred_arrival_output_dir.clone(),

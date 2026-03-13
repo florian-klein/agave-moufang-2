@@ -790,7 +790,6 @@ pub fn execute(
         voting_disabled: matches.is_present("no_voting") || restricted_repair_only_mode,
         wait_for_supermajority: value_t!(matches, "wait_for_supermajority", Slot).ok(),
         known_validators: run_args.known_validators,
-        trusted_shred_publishers: run_args.trusted_shred_publishers,
         repair_validators,
         repair_whitelist,
         repair_handler_type: RepairHandlerType::default(),
@@ -798,9 +797,6 @@ pub fn execute(
         max_ledger_shreds,
         blockstore_options: run_args.blockstore_options,
         run_verification: false,  // Skip verification by default for performance (readonly/trusted mode)
-        deferred_signature_verification: true,  // Execute before signature verification (10-100ms latency reduction)
-        deferred_poh_verification: true,  // Execute before PoH verification (1-10ms latency reduction)
-        prefetch_accounts: true,  // Prefetch accounts during verification (reduces execution latency)
         entry_cache: if matches.is_present("no_entry_cache") {
             None
         } else {

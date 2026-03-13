@@ -51,7 +51,6 @@ pub struct RunArgs {
     pub logfile: Option<PathBuf>,
     pub entrypoints: Vec<SocketAddr>,
     pub known_validators: Option<HashSet<Pubkey>>,
-    pub trusted_shred_publishers: Option<HashSet<IpAddr>>,
     pub socket_addr_space: SocketAddrSpace,
     pub rpc_bootstrap_config: RpcBootstrapConfig,
     pub blockstore_options: BlockstoreOptions,
@@ -115,15 +114,6 @@ impl FromClapArgMatches for RunArgs {
             "known validator",
         )?;
 
-        let trusted_shred_publishers = if matches.is_present("trusted_shred_publishers") {
-            let publishers: Option<HashSet<IpAddr>> = values_t!(matches, "trusted_shred_publishers", IpAddr)
-                .ok()
-                .map(|publishers| publishers.into_iter().collect());
-            publishers
-        } else {
-            None
-        };
-
         let socket_addr_space = SocketAddrSpace::new(matches.is_present("allow_private_addr"));
 
         Ok(RunArgs {
@@ -132,7 +122,6 @@ impl FromClapArgMatches for RunArgs {
             logfile,
             entrypoints,
             known_validators,
-            trusted_shred_publishers,
             socket_addr_space,
             rpc_bootstrap_config: RpcBootstrapConfig::from_clap_arg_match(matches)?,
             blockstore_options: BlockstoreOptions::from_clap_arg_match(matches)?,
@@ -552,36 +541,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Skip ledger verification at validator bootup."),
     )
     .arg(
-        Arg::with_name("deferred_signature_verification")
-            .long("deferred-signature-verification")
-            .takes_value(false)
-            .help(
-                "Execute transactions before signature verification completes. \
-                 Reduces latency for ShmPlugin notifications by 10-100ms. \
-                 WARNING: This is experimental and may execute invalid transactions."
-            ),
-    )
-    .arg(
-        Arg::with_name("deferred_poh_verification")
-            .long("deferred-poh-verification")
-            .takes_value(false)
-            .help(
-                "Execute transactions before PoH verification completes. \
-                 Reduces latency for ShmPlugin notifications by 1-10ms. \
-                 WARNING: This is experimental and may execute invalid transactions."
-            ),
-    )
-    .arg(
-        Arg::with_name("prefetch_accounts")
-            .long("prefetch-accounts")
-            .takes_value(false)
-            .help(
-                "Prefetch accounts into the read cache in background while \
-                 verification runs. This can reduce transaction execution latency \
-                 by warming the cache ahead of time."
-            ),
-    )
-    .arg(
         Arg::with_name("no_entry_cache")
             .long("no-entry-cache")
             .takes_value(false)
@@ -741,18 +700,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help(
                 "A list of validators to gossip with. If specified, gossip will not push/pull \
                  from from validators outside this set. [default: all validators]",
-            ),
-    )
-    .arg(
-        Arg::with_name("trusted_shred_publishers")
-            .long("trusted-shred-publisher")
-            .validator(solana_net_utils::is_host)
-            .value_name("IP ADDRESS")
-            .multiple(true)
-            .takes_value(true)
-            .help(
-                "A list of IP addresses for trusted shred publishers. Shreds from these addresses \
-                 will skip signature verification. [default: none]",
             ),
     )
     .arg(
@@ -1427,7 +1374,6 @@ mod tests {
                 PathBuf::from(format!("agave-validator-{}.log", identity_keypair.pubkey()));
             let entrypoints = vec![];
             let known_validators = None;
-            let trusted_shred_publishers = None;
 
             let json_rpc_config =
                 crate::commands::run::args::json_rpc_config::tests::default_json_rpc_config();
@@ -1438,7 +1384,6 @@ mod tests {
                 logfile: Some(logfile),
                 entrypoints,
                 known_validators,
-                trusted_shred_publishers,
                 socket_addr_space: SocketAddrSpace::Global,
                 rpc_bootstrap_config: RpcBootstrapConfig::default(),
                 blockstore_options: BlockstoreOptions::default(),
@@ -1462,7 +1407,6 @@ mod tests {
                 logfile: self.logfile.clone(),
                 entrypoints: self.entrypoints.clone(),
                 known_validators: self.known_validators.clone(),
-                trusted_shred_publishers: self.trusted_shred_publishers.clone(),
                 socket_addr_space: self.socket_addr_space,
                 ledger_path: self.ledger_path.clone(),
                 rpc_bootstrap_config: self.rpc_bootstrap_config.clone(),

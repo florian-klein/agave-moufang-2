@@ -5894,9 +5894,7 @@ impl AccountsDb {
                     // With obsolete accounts enabled, all zero lamport accounts
                     // are obsolete or single ref by the end of index generation
                     // Store the offsets here
-                    if self.mark_obsolete_accounts == MarkObsoleteAccounts::Enabled {
-                        zero_lamport_offsets.push(offset);
-                    }
+                    zero_lamport_offsets.push(offset);
                     accum.zero_lamport_pubkeys.push(*account.pubkey);
                 }
                 keyed_account_infos.push((
@@ -5980,10 +5978,8 @@ impl AccountsDb {
             // to avoid having to revisit them later
             // This is safe with obsolete accounts as all zero lamport accounts will be single ref
             // or obsolete by the end of index generation
-            if self.mark_obsolete_accounts == MarkObsoleteAccounts::Enabled {
-                storage.batch_insert_zero_lamport_single_ref_account_offsets(zero_lamport_offsets);
-                accum.zero_lamport_pubkeys.clear();
-            };
+            storage.batch_insert_zero_lamport_single_ref_account_offsets(zero_lamport_offsets);
+            accum.zero_lamport_pubkeys.clear();
         }
 
         accum.num_accounts += insert_info.count as u64;
@@ -6175,11 +6171,6 @@ impl AccountsDb {
                         HashSet::<Pubkey>::from_iter(slot_keys.iter().map(|(_, key)| *key));
                     // With obsolete accounts enabled, duplicate pubkeys will be removed as part of
                     // index generation and do not need to be revisited by clean later
-                    if self.mark_obsolete_accounts == MarkObsoleteAccounts::Disabled {
-                        for (slot, key) in slot_keys {
-                            self.uncleaned_pubkeys.entry(slot).or_default().push(key);
-                        }
-                    }
                     let unique_pubkeys_by_bin_inner = unique_keys.into_iter().collect::<Vec<_>>();
                     total_num_unique_duplicate_keys
                         .fetch_add(unique_pubkeys_by_bin_inner.len() as u64, Ordering::Relaxed);
@@ -6304,22 +6295,20 @@ impl AccountsDb {
 
         self.set_storage_count_and_alive_bytes(total_accum.storage_info, &mut timings);
 
-        if self.mark_obsolete_accounts == MarkObsoleteAccounts::Enabled {
-            let mut mark_obsolete_accounts_time = Measure::start("mark_obsolete_accounts_time");
-            // Mark all reclaims at max_slot. This is safe because only the snapshot paths care about
-            // this information. Since this account was just restored from the previous snapshot and
-            // it is known that it was already obsolete at that time, it must hold true that it will
-            // still be obsolete if a newer snapshot is created, since a newer snapshot will always
-            // be performed on a slot greater than the current slot
-            let slot_marked_obsolete = storages.last().unwrap().slot();
-            let obsolete_account_stats =
-                self.mark_obsolete_accounts_at_startup(slot_marked_obsolete, unique_pubkeys_by_bin);
+        let mut mark_obsolete_accounts_time = Measure::start("mark_obsolete_accounts_time");
+        // Mark all reclaims at max_slot. This is safe because only the snapshot paths care about
+        // this information. Since this account was just restored from the previous snapshot and
+        // it is known that it was already obsolete at that time, it must hold true that it will
+        // still be obsolete if a newer snapshot is created, since a newer snapshot will always
+        // be performed on a slot greater than the current slot
+        let slot_marked_obsolete = storages.last().unwrap().slot();
+        let obsolete_account_stats =
+            self.mark_obsolete_accounts_at_startup(slot_marked_obsolete, unique_pubkeys_by_bin);
 
-            mark_obsolete_accounts_time.stop();
-            timings.mark_obsolete_accounts_us = mark_obsolete_accounts_time.as_us();
-            timings.num_obsolete_accounts_marked = obsolete_account_stats.accounts_marked_obsolete;
-            timings.num_slots_removed_as_obsolete = obsolete_account_stats.slots_removed;
-        }
+        mark_obsolete_accounts_time.stop();
+        timings.mark_obsolete_accounts_us = mark_obsolete_accounts_time.as_us();
+        timings.num_obsolete_accounts_marked = obsolete_account_stats.accounts_marked_obsolete;
+        timings.num_slots_removed_as_obsolete = obsolete_account_stats.slots_removed;
         total_time.stop();
         timings.total_time_us = total_time.as_us();
         timings.report(self.accounts_index.get_startup_stats());
@@ -6861,11 +6850,8 @@ impl AccountsDb {
     // and no longer need to be referenced. This leads to a static reference count
     // of 1. As referencing checking is common in tests, this test wrapper abstracts the behavior
     pub fn assert_ref_count(&self, pubkey: &Pubkey, expected_ref_count: RefCount) {
-        let expected_ref_count = match self.mark_obsolete_accounts {
-            MarkObsoleteAccounts::Disabled => expected_ref_count,
-            // When obsolete accounts are marked, the ref count is always 1 or 0
-            MarkObsoleteAccounts::Enabled => expected_ref_count.min(1),
-        };
+        // When obsolete accounts are marked, the ref count is always 1 or 0
+        let expected_ref_count = expected_ref_count.min(1);
 
         assert_eq!(
             self.accounts_index.ref_count_from_storage(pubkey),

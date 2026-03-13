@@ -41,7 +41,8 @@ use {
         invoke_context::{EnvironmentConfig, InvokeContext},
         loaded_programs::{
             EpochBoundaryPreparation, ForkGraph, ProgramCache, ProgramCacheEntry,
-            ProgramCacheForTxBatch, ProgramCacheMatchCriteria, ProgramRuntimeEnvironments,
+            ProgramCacheForTxBatch, ProgramCacheMatchCriteria, ProgramRuntimeEnvironment,
+            ProgramRuntimeEnvironments,
         },
         sysvar_cache::SysvarCache,
     },
@@ -66,10 +67,7 @@ use {
 #[cfg(feature = "dev-context-only-utils")]
 use {
     qualifier_attr::{field_qualifiers, qualifiers},
-    solana_program_runtime::{
-        loaded_programs::ProgramRuntimeEnvironment,
-        solana_sbpf::{program::BuiltinProgram, vm::Config as VmConfig},
-    },
+    solana_program_runtime::solana_sbpf::{program::BuiltinProgram, vm::Config as VmConfig},
     std::sync::Weak,
 };
 
@@ -380,6 +378,15 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             .unwrap()
             .get_upcoming_environments_for_epoch(epoch)
             .unwrap_or_else(|| self.environments.clone())
+    }
+
+    /// Returns the v1 program runtime environment for the given epoch.
+    /// Convenience wrapper for code that only needs the v1 environment.
+    pub fn program_runtime_environment_for_epoch(
+        &self,
+        epoch: Epoch,
+    ) -> ProgramRuntimeEnvironment {
+        self.get_environments_for_epoch(epoch).program_runtime_v1
     }
 
     pub fn sysvar_cache(&self) -> RwLockReadGuard<'_, SysvarCache> {

@@ -32,8 +32,6 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         gossip_validators: config.gossip_validators.clone(),
         max_genesis_archive_unpacked_size: config.max_genesis_archive_unpacked_size,
         run_verification: config.run_verification,
-        deferred_signature_verification: config.deferred_signature_verification,
-        deferred_poh_verification: config.deferred_poh_verification,
         require_tower: config.require_tower,
         tower_storage: config.tower_storage.clone(),
         vote_history_storage: config.vote_history_storage.clone(),
@@ -82,7 +80,6 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         delay_leader_block_for_pending_fork: config.delay_leader_block_for_pending_fork,
         voting_service_test_override: config.voting_service_test_override.clone(),
         repair_handler_type: config.repair_handler_type.clone(),
-        trusted_shred_publishers: config.trusted_shred_publishers.clone(),
         shredstream_config: config.shredstream_config.clone(),
         snapshot_packager_niceness_adj: config.snapshot_packager_niceness_adj,
     }

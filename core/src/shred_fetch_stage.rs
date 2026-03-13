@@ -73,7 +73,6 @@ impl ShredFetchStage {
         flags: PacketFlags,
         repair_context: Option<&RepairContext>,
         turbine_disabled: Arc<AtomicBool>,
-        trusted_shred_publishers: Option<Arc<std::collections::HashSet<std::net::IpAddr>>>,
         fetch_stage_tracer: Option<FetchStageArrivalSender>,
     ) {
         // Only repair shreds need repair context.
@@ -238,7 +237,6 @@ impl ShredFetchStage {
         flags: PacketFlags,
         repair_context: Option<RepairContext>,
         turbine_disabled: Arc<AtomicBool>,
-        trusted_shred_publishers: Option<Arc<std::collections::HashSet<std::net::IpAddr>>>,
         fetch_stage_tracer: Option<FetchStageArrivalSender>,
     ) -> (Vec<JoinHandle<()>>, JoinHandle<()>) {
         let sharable_banks = bank_forks.read().unwrap().sharable_banks();
@@ -275,7 +273,6 @@ impl ShredFetchStage {
                     flags,
                     repair_context.as_ref(),
                     turbine_disabled,
-                    trusted_shred_publishers.clone(),
                     fetch_stage_tracer,
                 )
             })
@@ -296,7 +293,6 @@ impl ShredFetchStage {
         outstanding_repair_requests: Arc<RwLock<OutstandingShredRepairs>>,
         turbine_disabled: Arc<AtomicBool>,
         exit: Arc<AtomicBool>,
-        trusted_shred_publishers: Arc<std::collections::HashSet<std::net::IpAddr>>,
         fetch_stage_tracer: Option<FetchStageArrivalSender>,
     ) -> Self {
         let recycler = PacketBatchRecycler::warmed(100, 1024);
@@ -320,7 +316,6 @@ impl ShredFetchStage {
             PacketFlags::empty(),
             None, // repair_context
             turbine_disabled.clone(),
-            Some(trusted_shred_publishers.clone()),
             fetch_stage_tracer.clone(),
         );
 
@@ -338,7 +333,6 @@ impl ShredFetchStage {
             PacketFlags::REPAIR,
             Some(repair_context.clone()),
             turbine_disabled.clone(),
-            None,
             fetch_stage_tracer.clone(),
         );
 
@@ -380,7 +374,6 @@ impl ShredFetchStage {
                             // No ping packets but need to verify repair nonce.
                             Some(&repair_context),
                             turbine_disabled,
-                            None,
                             fetch_stage_tracer_clone,
                         )
                     })
@@ -415,7 +408,6 @@ impl ShredFetchStage {
                         PacketFlags::empty(),
                         None, // repair_context
                         turbine_disabled,
-                        Some(trusted_shred_publishers.clone()),
                         fetch_stage_tracer,
                     )
                 })

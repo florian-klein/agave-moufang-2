@@ -172,17 +172,6 @@ pub struct TvuConfig {
     pub replay_transactions_threads: NonZeroUsize,
     pub shred_sigverify_threads: NonZeroUsize,
     pub xdp_sender: Option<XdpSender>,
-    pub trusted_shred_publishers: Arc<std::collections::HashSet<std::net::IpAddr>>,
-    /// When true, execute transactions before signature verification completes.
-    /// Signature verification runs asynchronously after execution, reducing
-    /// latency for ShmPlugin notifications by 10-100ms. Consensus safety is maintained.
-    pub deferred_signature_verification: bool,
-    /// When true, execute transactions before PoH verification completes.
-    /// PoH verification runs after execution, reducing latency for ShmPlugin notifications.
-    pub deferred_poh_verification: bool,
-    /// When true, prefetch accounts into the read cache in background while
-    /// verification runs, reducing latency for transaction execution.
-    pub prefetch_accounts: bool,
     /// Optional entry cache for low-latency entry access during replay.
     /// When provided, entries are read from cache first, falling back to blockstore.
     pub entry_cache: Option<Arc<solana_ledger::entry_cache::EntryCache>>,
@@ -212,11 +201,6 @@ impl Default for TvuConfig {
             replay_transactions_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             shred_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             xdp_sender: None,
-            trusted_shred_publishers: Arc::default(),
-            deferred_signature_verification: false,
-            // OPTIMIZATION: Enable deferred PoH verification for lower latency (1-10ms savings)
-            deferred_poh_verification: true,
-            prefetch_accounts: false,
             entry_cache: None,
             shred_arrival_tracing_enabled: false,
             shred_arrival_output_dir: PathBuf::from("shred_arrivals"),
@@ -439,7 +423,6 @@ impl Tvu {
             outstanding_repair_requests.clone(),
             turbine_disabled,
             exit.clone(),
-            tvu_config.trusted_shred_publishers,
             fetch_stage_tracer,
         );
 
@@ -780,9 +763,6 @@ impl Tvu {
             prioritization_fee_cache,
             banking_tracer,
             snapshot_controller,
-            deferred_signature_verification: tvu_config.deferred_signature_verification,
-            deferred_poh_verification: tvu_config.deferred_poh_verification,
-            prefetch_accounts: tvu_config.prefetch_accounts,
             entry_cache: tvu_config.entry_cache.clone(),
             dataset_execution_sender: dataset_execution_sender.clone(),
             tick_tracking_sender: tick_tracking_sender.clone(),

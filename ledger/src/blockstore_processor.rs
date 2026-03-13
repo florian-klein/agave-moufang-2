@@ -1121,19 +1121,6 @@ pub type ProcessSlotCallback = Arc<dyn Fn(&Bank) + Sync + Send>;
 pub struct ProcessOptions {
     /// Run PoH, transaction signature and other transaction verification on the entries.
     pub run_verification: bool,
-    /// When true, execute transactions before signature verification completes.
-    /// Signature verification runs asynchronously after execution.
-    /// This reduces latency for ShmPlugin notifications by 10-100ms.
-    /// Consensus safety is maintained - verification still happens before slot confirmation.
-    pub deferred_signature_verification: bool,
-    /// When true, execute transactions before PoH (Proof of History) verification completes.
-    /// PoH verification runs after execution. Combined with deferred_signature_verification,
-    /// this can reduce latency for ShmPlugin notifications by an additional 1-10ms.
-    /// WARNING: This means transactions may execute on entries with invalid PoH.
-    pub deferred_poh_verification: bool,
-    /// When true, prefetch account data into the read cache while verification runs.
-    /// This can reduce execution latency by warming the cache in parallel with verification.
-    pub prefetch_accounts: bool,
     pub full_leader_cache: bool,
     pub halt_at_slot: Option<Slot>,
     pub slot_callback: Option<ProcessSlotCallback>,
@@ -1468,9 +1455,6 @@ fn confirm_full_slot(
         &mut confirmation_timing,
         progress,
         skip_verification,
-        opts.deferred_signature_verification,
-        opts.deferred_poh_verification,
-        opts.prefetch_accounts,
         transaction_status_sender,
         entry_notification_sender,
         replay_vote_sender,
@@ -2023,9 +2007,6 @@ pub fn confirm_slot(
     timing: &mut ConfirmationTiming,
     progress: &mut ConfirmationProgress,
     skip_verification: bool,
-    deferred_signature_verification: bool,
-    deferred_poh_verification: bool,
-    prefetch_accounts: bool,
     transaction_status_sender: Option<&TransactionStatusSender>,
     entry_notification_sender: Option<&EntryNotifierSender>,
     replay_vote_sender: Option<&ReplayVoteSender>,
@@ -2079,9 +2060,6 @@ pub fn confirm_slot(
         timing,
         progress,
         skip_verification,
-        deferred_signature_verification,
-        deferred_poh_verification,
-        prefetch_accounts,
         transaction_status_sender,
         entry_notification_sender,
         replay_vote_sender,
@@ -2103,9 +2081,6 @@ fn confirm_slot_entries(
     timing: &mut ConfirmationTiming,
     progress: &mut ConfirmationProgress,
     skip_verification: bool,
-    deferred_signature_verification: bool,
-    deferred_poh_verification: bool,
-    _prefetch_accounts: bool,
     transaction_status_sender: Option<&TransactionStatusSender>,
     _entry_notification_sender: Option<&EntryNotifierSender>,
     replay_vote_sender: Option<&ReplayVoteSender>,
@@ -5640,9 +5615,6 @@ pub mod tests {
             &mut ConfirmationTiming::default(),
             &mut progress,
             false,
-            false, // deferred_signature_verification
-            false, // deferred_poh_verification
-            false, // prefetch_accounts
             None,
             None,
             None,
@@ -5741,9 +5713,6 @@ pub mod tests {
             &mut timing,
             &mut progress,
             false,
-            false, // deferred_signature_verification
-            false, // deferred_poh_verification
-            false, // prefetch_accounts
             Some(&transaction_status_sender),
             None,
             None,
@@ -5795,9 +5764,6 @@ pub mod tests {
             &mut timing,
             &mut progress,
             false,
-            false, // deferred_signature_verification
-            false, // deferred_poh_verification
-            false, // prefetch_accounts
             Some(&transaction_status_sender),
             None,
             None,
@@ -6352,9 +6318,6 @@ pub mod tests {
             &mut timing_full,
             &mut progress_full,
             false, // skip_verification = false (full verification)
-            false, // deferred_signature_verification = false
-            false, // deferred_poh_verification = false
-            false, // prefetch_accounts = false
             None,
             None,
             None,
@@ -6383,9 +6346,6 @@ pub mod tests {
             &mut timing_deferred,
             &mut progress_deferred,
             false, // skip_verification = false
-            true,  // deferred_signature_verification = true
-            false, // deferred_poh_verification = false
-            false, // prefetch_accounts = false
             None,
             None,
             None,
@@ -6496,9 +6456,6 @@ pub mod tests {
             &mut timing_no_prefetch,
             &mut progress_no_prefetch,
             false, // skip_verification = false
-            false, // deferred_signature_verification = false
-            false, // deferred_poh_verification = false
-            false, // prefetch_accounts = false
             None,
             None,
             None,
@@ -6527,9 +6484,6 @@ pub mod tests {
             &mut timing_prefetch,
             &mut progress_prefetch,
             false, // skip_verification = false
-            false, // deferred_signature_verification = false
-            false, // deferred_poh_verification = false
-            true,  // prefetch_accounts = true
             None,
             None,
             None,
