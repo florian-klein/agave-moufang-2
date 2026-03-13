@@ -361,9 +361,6 @@ pub struct ValidatorConfig {
     /// Run PoH, transaction signature and other transaction verification during blockstore
     /// processing.
     pub run_verification: bool,
-    /// Optional entry cache for low-latency entry access during replay.
-    /// When provided, entries are read from cache first, falling back to blockstore.
-    pub entry_cache: Option<Arc<solana_ledger::entry_cache::EntryCache>>,
     /// Enable shred arrival tracing to CSV files.
     /// When enabled, arrival metadata (timestamp, source IP, source type) is
     /// captured for each shred and written to CSV when completed data sets are produced.
@@ -448,8 +445,6 @@ impl ValidatorConfig {
             gossip_validators: None,
             max_genesis_archive_unpacked_size: MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
             run_verification: false,
-            // Enable entry cache by default for lower latency replay (32 slots = ~13 seconds)
-            entry_cache: Some(Arc::new(solana_ledger::entry_cache::EntryCache::new(32))),
             shred_arrival_tracing_enabled: false,
             shred_arrival_output_dir: PathBuf::from("shred_arrivals"),
             require_tower: false,
@@ -1709,7 +1704,6 @@ impl Validator {
                 replay_transactions_threads: config.replay_transactions_threads,
                 shred_sigverify_threads: config.tvu_shred_sigverify_threads,
                 xdp_sender: xdp_sender.clone(),
-                entry_cache: config.entry_cache.clone(),
                 shred_arrival_tracing_enabled: config.shred_arrival_tracing_enabled,
                 shred_arrival_output_dir: config.shred_arrival_output_dir.clone(),
                 tx_execution_sender: tx_execution_sender.clone(),

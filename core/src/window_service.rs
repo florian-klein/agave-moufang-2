@@ -16,12 +16,10 @@ use {
     crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender},
     rayon::{ThreadPool, prelude::*},
     solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
-    solana_entry::entry::Entry,
     solana_gossip::cluster_info::ClusterInfo,
     solana_ledger::{
         blockstore::{Blockstore, BlockstoreInsertionMetrics, PossibleDuplicateShred},
         dataset_tracking::DatasetSignatureSender,
-        entry_cache::EntryCache,
         leader_schedule_cache::LeaderScheduleCache,
         shred::{self, ReedSolomonCache, Shred},
         shred_arrival_store::{ShredArrivalBuffer, ShredArrivalMeta},
@@ -67,11 +65,6 @@ struct WindowServiceMetrics {
     // Hot path timing metrics (time to replay)
     shred_payload_build_us: u64,
     blockstore_insert_elapsed_us: u64,
-    // Entry cache metrics
-    entry_cache_inserts: u64,
-    entry_cache_last_index_from_batch: u64,
-    entry_cache_last_index_from_blockstore: u64,
-    entry_cache_last_index_none: u64,
     // Early prefetch metrics
     early_prefetch_keys_extracted: u64,
     early_prefetch_spawned: u64,
@@ -116,23 +109,6 @@ impl WindowServiceMetrics {
             (
                 "blockstore_insert_elapsed_us",
                 self.blockstore_insert_elapsed_us,
-                i64
-            ),
-            // Entry cache metrics
-            ("entry_cache_inserts", self.entry_cache_inserts, i64),
-            (
-                "entry_cache_last_index_from_batch",
-                self.entry_cache_last_index_from_batch,
-                i64
-            ),
-            (
-                "entry_cache_last_index_from_blockstore",
-                self.entry_cache_last_index_from_blockstore,
-                i64
-            ),
-            (
-                "entry_cache_last_index_none",
-                self.entry_cache_last_index_none,
                 i64
             ),
             // Early prefetch metrics
@@ -267,7 +243,6 @@ fn run_insert<F>(
     completed_data_sets_sender: Option<&CompletedDataSetsSender>,
     reed_solomon_cache: &ReedSolomonCache,
     latency_event_sender: Option<&LatencyEventSender>,
-    entry_cache: Option<&EntryCache>,
     _bank_forks: &RwLock<BankForks>, // Unused after disabling early prefetch (data staleness fix)
     shred_arrival_buffer: Option<&ShredArrivalBuffer>,
     dataset_signature_sender: Option<&DatasetSignatureSender>,
@@ -465,9 +440,6 @@ pub struct WindowServiceChannels {
     pub repair_service_channels: RepairServiceChannels,
     /// Optional sender for latency tracking events
     pub latency_event_sender: Option<LatencyEventSender>,
-    /// Optional entry cache for low-latency entry access during replay.
-    /// When provided, entries are written to cache immediately after shred insertion.
-    pub entry_cache: Option<Arc<EntryCache>>,
     /// Optional buffer for shred arrival tracing.
     /// When provided, arrival metadata is recorded and CSV files are written
     /// when completed data sets are produced.
@@ -492,7 +464,6 @@ impl WindowServiceChannels {
         duplicate_slots_sender: DuplicateSlotSender,
         repair_service_channels: RepairServiceChannels,
         latency_event_sender: Option<LatencyEventSender>,
-        entry_cache: Option<Arc<EntryCache>>,
         shred_arrival_buffer: Option<Arc<ShredArrivalBuffer>>,
         dataset_signature_sender: Option<Arc<DatasetSignatureSender>>,
         window_service_event_sender: Option<WindowServiceEventSender>,
@@ -503,7 +474,6 @@ impl WindowServiceChannels {
             duplicate_slots_sender,
             repair_service_channels,
             latency_event_sender,
-            entry_cache,
             shred_arrival_buffer,
             dataset_signature_sender,
             window_service_event_sender,
@@ -537,7 +507,6 @@ impl WindowService {
             duplicate_slots_sender,
             repair_service_channels,
             latency_event_sender,
-            entry_cache,
             shred_arrival_buffer,
             dataset_signature_sender,
             window_service_event_sender,
@@ -572,7 +541,6 @@ impl WindowService {
             duplicate_sender,
             completed_data_sets_sender,
             latency_event_sender,
-            entry_cache,
             bank_forks,
             shred_arrival_buffer,
             dataset_signature_sender,
@@ -631,7 +599,6 @@ impl WindowService {
         check_duplicate_sender: Sender<PossibleDuplicateShred>,
         completed_data_sets_sender: Option<CompletedDataSetsSender>,
         latency_event_sender: Option<LatencyEventSender>,
-        entry_cache: Option<Arc<EntryCache>>,
         bank_forks: Arc<RwLock<BankForks>>,
         shred_arrival_buffer: Option<Arc<ShredArrivalBuffer>>,
         dataset_signature_sender: Option<Arc<DatasetSignatureSender>>,
@@ -661,7 +628,6 @@ impl WindowService {
                         completed_data_sets_sender.as_ref(),
                         &reed_solomon_cache,
                         latency_event_sender.as_ref(),
-                        entry_cache.as_deref(),
                         &bank_forks,
                         shred_arrival_buffer.as_deref(),
                         dataset_signature_sender.as_deref(),

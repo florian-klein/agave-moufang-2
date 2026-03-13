@@ -41,9 +41,6 @@ pub enum WindowServiceEventType {
     /// Inserting shreds into blockstore
     BlockstoreInsertStart,
     BlockstoreInsertEnd,
-    /// Populating entry cache
-    EntryCacheStart,
-    EntryCacheEnd,
     /// Recording shred arrivals for CSV
     ShredArrivalRecordStart,
     ShredArrivalRecordEnd,
@@ -69,8 +66,6 @@ impl WindowServiceEventType {
             Self::LatencyEventRecord => "latency_event_record",
             Self::BlockstoreInsertStart => "blockstore_insert_start",
             Self::BlockstoreInsertEnd => "blockstore_insert_end",
-            Self::EntryCacheStart => "entry_cache_start",
-            Self::EntryCacheEnd => "entry_cache_end",
             Self::ShredArrivalRecordStart => "shred_arrival_record_start",
             Self::ShredArrivalRecordEnd => "shred_arrival_record_end",
             Self::SignalStart => "signal_start",

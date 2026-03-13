@@ -172,9 +172,6 @@ pub struct TvuConfig {
     pub replay_transactions_threads: NonZeroUsize,
     pub shred_sigverify_threads: NonZeroUsize,
     pub xdp_sender: Option<XdpSender>,
-    /// Optional entry cache for low-latency entry access during replay.
-    /// When provided, entries are read from cache first, falling back to blockstore.
-    pub entry_cache: Option<Arc<solana_ledger::entry_cache::EntryCache>>,
     /// Enable shred arrival tracing to CSV files
     pub shred_arrival_tracing_enabled: bool,
     /// Directory for shred arrival CSV files
@@ -201,7 +198,6 @@ impl Default for TvuConfig {
             replay_transactions_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             shred_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             xdp_sender: None,
-            entry_cache: None,
             shred_arrival_tracing_enabled: false,
             shred_arrival_output_dir: PathBuf::from("shred_arrivals"),
             tx_execution_sender: None,
@@ -632,7 +628,6 @@ impl Tvu {
                 duplicate_slots_sender.clone(),
                 repair_service_channels,
                 Some(latency_event_sender.clone()),
-                tvu_config.entry_cache.clone(),
                 shred_arrival_buffer,
                 dataset_signature_sender,
                 window_service_tracer,
@@ -763,7 +758,6 @@ impl Tvu {
             prioritization_fee_cache,
             banking_tracer,
             snapshot_controller,
-            entry_cache: tvu_config.entry_cache.clone(),
             dataset_execution_sender: dataset_execution_sender.clone(),
             tick_tracking_sender: tick_tracking_sender.clone(),
             replay_batch_sender: replay_batch_sender.clone(),

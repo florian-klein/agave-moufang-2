@@ -1460,7 +1460,6 @@ fn confirm_full_slot(
         opts.allow_dead_slots,
         opts.runtime_config.log_messages_bytes_limit,
         None,
-        None, // entry_cache - not used in full slot confirmation
         None, // dataset_execution_sender - not used in full slot confirmation
         None, // tick_tracking_sender - not used in full slot confirmation
         None, // tx_cost_priority_sender - not used in full slot confirmation
@@ -2012,7 +2011,6 @@ pub fn confirm_slot(
     allow_dead_slots: bool,
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: Option<&PrioritizationFeeCache>,
-    entry_cache: Option<&crate::entry_cache::EntryCache>,
     dataset_execution_sender: Option<&crate::dataset_tracking::DatasetExecutionSender>,
     tick_tracking_sender: Option<&crate::dataset_tracking::TickTrackingSender>,
     tx_cost_priority_sender: Option<&crate::dataset_tracking::TxCostPrioritySender>,
@@ -2023,25 +2021,9 @@ pub fn confirm_slot(
     let slot_entries_load_result = {
         let mut load_elapsed = Measure::start("load_elapsed");
 
-        // Try cache first for lower latency
-        let load_result = if let Some(cache) = entry_cache {
-            if let Some((entries, num_shreds, is_full)) = cache.get_slot_entries(slot, progress.num_shreds) {
-                trace!(
-                    "Entry cache hit for slot {slot}, num_entries: {}, num_shreds: {num_shreds}",
-                    entries.len()
-                );
-                Ok((entries, num_shreds, is_full))
-            } else {
-                trace!("Entry cache miss for slot {slot}, falling back to blockstore");
-                blockstore
-                    .get_slot_entries_with_shred_info(slot, progress.num_shreds, allow_dead_slots)
-                    .map_err(BlockstoreProcessorError::FailedToLoadEntries)
-            }
-        } else {
-            blockstore
-                .get_slot_entries_with_shred_info(slot, progress.num_shreds, allow_dead_slots)
-                .map_err(BlockstoreProcessorError::FailedToLoadEntries)
-        };
+        let load_result = blockstore
+            .get_slot_entries_with_shred_info(slot, progress.num_shreds, allow_dead_slots)
+            .map_err(BlockstoreProcessorError::FailedToLoadEntries);
 
         load_elapsed.stop();
         if load_result.is_err() {

@@ -797,11 +797,6 @@ pub fn execute(
         max_ledger_shreds,
         blockstore_options: run_args.blockstore_options,
         run_verification: false,  // Skip verification by default for performance (readonly/trusted mode)
-        entry_cache: if matches.is_present("no_entry_cache") {
-            None
-        } else {
-            Some(std::sync::Arc::new(solana_ledger::entry_cache::EntryCache::new(32)))
-        },
         shred_arrival_tracing_enabled: matches.is_present("enable_shred_arrival_tracing"),
         shred_arrival_output_dir: PathBuf::from(
             matches

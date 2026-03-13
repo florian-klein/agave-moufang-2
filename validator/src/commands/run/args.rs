@@ -541,17 +541,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Skip ledger verification at validator bootup."),
     )
     .arg(
-        Arg::with_name("no_entry_cache")
-            .long("no-entry-cache")
-            .takes_value(false)
-            .help(
-                "Disable entry cache for replay. By default, entries are read from \
-                 an in-memory cache first, falling back to blockstore. This reduces \
-                 replay latency by 100-500us per entry batch. Use this flag to disable \
-                 caching if you experience issues."
-            ),
-    )
-    .arg(
         Arg::with_name("enable_shred_arrival_tracing")
             .long("enable-shred-arrival-tracing")
             .takes_value(false)

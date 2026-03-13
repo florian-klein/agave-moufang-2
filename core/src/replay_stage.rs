@@ -288,9 +288,6 @@ pub struct ReplayStageConfig {
     pub prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
     pub banking_tracer: Arc<BankingTracer>,
     pub snapshot_controller: Option<Arc<SnapshotController>>,
-    /// Optional entry cache for low-latency entry access during replay.
-    /// When provided, entries are read from cache first, falling back to blockstore.
-    pub entry_cache: Option<Arc<solana_ledger::entry_cache::EntryCache>>,
     /// Optional sender for dataset execution timing CSV tracking.
     pub dataset_execution_sender:
         Option<Arc<solana_ledger::dataset_tracking::DatasetExecutionSender>>,
@@ -628,7 +625,6 @@ impl ReplayStage {
             prioritization_fee_cache,
             banking_tracer,
             snapshot_controller,
-            entry_cache,
             dataset_execution_sender,
             tx_execution_sender,
             tx_cost_priority_sender,
@@ -858,7 +854,6 @@ impl ReplayStage {
                     &mut purge_repair_slot_counter,
                     (!migration_status.is_alpenglow_enabled()).then_some(&mut tbft_structs),
                     &latency_event_sender,
-                    entry_cache.as_deref(),
                     dataset_execution_sender.as_deref(),
                     tick_tracking_sender.as_deref(),
                     tx_cost_priority_sender.as_deref(),
@@ -2538,7 +2533,6 @@ impl ReplayStage {
         replay_vote_sender: &ReplayVoteSender,
         log_messages_bytes_limit: Option<usize>,
         prioritization_fee_cache: Option<&PrioritizationFeeCache>,
-        entry_cache: Option<&solana_ledger::entry_cache::EntryCache>,
         dataset_execution_sender: Option<&solana_ledger::dataset_tracking::DatasetExecutionSender>,
         tick_tracking_sender: Option<&solana_ledger::dataset_tracking::TickTrackingSender>,
         tx_cost_priority_sender: Option<&solana_ledger::dataset_tracking::TxCostPrioritySender>,
@@ -2563,7 +2557,6 @@ impl ReplayStage {
             false,
             log_messages_bytes_limit,
             prioritization_fee_cache,
-            entry_cache,
             dataset_execution_sender,
             tick_tracking_sender,
             tx_cost_priority_sender,
@@ -3235,7 +3228,6 @@ impl ReplayStage {
         log_messages_bytes_limit: Option<usize>,
         active_bank_slots: &[Slot],
         prioritization_fee_cache: Option<&PrioritizationFeeCache>,
-        entry_cache: Option<&solana_ledger::entry_cache::EntryCache>,
         dataset_execution_sender: Option<&solana_ledger::dataset_tracking::DatasetExecutionSender>,
         tick_tracking_sender: Option<&solana_ledger::dataset_tracking::TickTrackingSender>,
         tx_cost_priority_sender: Option<&solana_ledger::dataset_tracking::TxCostPrioritySender>,
@@ -3321,7 +3313,6 @@ impl ReplayStage {
                             &replay_vote_sender.clone(),
                             log_messages_bytes_limit,
                             prioritization_fee_cache,
-                            entry_cache,
                             dataset_execution_sender,
                             tick_tracking_sender,
                             tx_cost_priority_sender,
@@ -3358,7 +3349,6 @@ impl ReplayStage {
         log_messages_bytes_limit: Option<usize>,
         bank_slot: Slot,
         prioritization_fee_cache: Option<&PrioritizationFeeCache>,
-        entry_cache: Option<&solana_ledger::entry_cache::EntryCache>,
         dataset_execution_sender: Option<&solana_ledger::dataset_tracking::DatasetExecutionSender>,
         tick_tracking_sender: Option<&solana_ledger::dataset_tracking::TickTrackingSender>,
         tx_cost_priority_sender: Option<&solana_ledger::dataset_tracking::TxCostPrioritySender>,
@@ -3440,7 +3430,6 @@ impl ReplayStage {
                     &replay_vote_sender.clone(),
                     log_messages_bytes_limit,
                     prioritization_fee_cache,
-                    entry_cache,
                     dataset_execution_sender,
                     tick_tracking_sender,
                     tx_cost_priority_sender,
@@ -3869,7 +3858,6 @@ impl ReplayStage {
         purge_repair_slot_counter: &mut PurgeRepairSlotCounter,
         tbft_structs: Option<&mut TowerBFTStructures>,
         latency_event_sender: &Option<LatencyEventSender>,
-        entry_cache: Option<&solana_ledger::entry_cache::EntryCache>,
         dataset_execution_sender: Option<&solana_ledger::dataset_tracking::DatasetExecutionSender>,
         tick_tracking_sender: Option<&solana_ledger::dataset_tracking::TickTrackingSender>,
         tx_cost_priority_sender: Option<&solana_ledger::dataset_tracking::TxCostPrioritySender>,
@@ -3902,7 +3890,6 @@ impl ReplayStage {
                     log_messages_bytes_limit,
                     &active_bank_slots,
                     prioritization_fee_cache,
-                    entry_cache,
                     dataset_execution_sender,
                     tick_tracking_sender,
                     tx_cost_priority_sender,
@@ -3926,7 +3913,6 @@ impl ReplayStage {
                         log_messages_bytes_limit,
                         *bank_slot,
                         prioritization_fee_cache,
-                        entry_cache,
                         dataset_execution_sender,
                         tick_tracking_sender,
                         tx_cost_priority_sender,
@@ -5653,7 +5639,6 @@ pub(crate) mod tests {
                 &replay_vote_sender,
                 None,
                 Some(&PrioritizationFeeCache::new(0u64)),
-                None,  // entry_cache
                 None,  // dataset_execution_sender
                 None,  // tick_tracking_sender
                 None,  // tx_cost_priority_sender
