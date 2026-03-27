@@ -12,7 +12,6 @@ use {
         account_info::{AccountInfo, StorageLocation},
         accounts::{AccountAddressFilter, Accounts},
         accounts_db::{ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS, AccountFromStorage, AccountsDb},
-        accounts_index::ScanConfig,
         ancestors::Ancestors,
     },
     solana_hash::Hash,
@@ -137,7 +136,6 @@ fn bench_concurrent_scan_write(bencher: &mut Bencher) {
                         &Ancestors::default(),
                         0,
                         AccountSharedData::default().owner(),
-                        &ScanConfig::default(),
                     )
                     .unwrap(),
             );
@@ -220,7 +218,6 @@ fn bench_load_largest_accounts(b: &mut Bencher) {
             20,
             &HashSet::new(),
             AccountAddressFilter::Exclude,
-            false,
         )
     });
 }

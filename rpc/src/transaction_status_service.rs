@@ -18,8 +18,8 @@ use {
     },
     solana_svm::transaction_commit_result::CommittedTransaction,
     solana_transaction_status::{
-        extract_and_fmt_memos, map_inner_instructions, Reward, RewardsAndNumPartitions,
-        TransactionStatusMeta,
+        Reward, RewardsAndNumPartitions, TransactionStatusMeta, extract_and_fmt_memos,
+        map_inner_instructions,
     },
     std::{
         sync::{
@@ -134,8 +134,8 @@ impl TransactionStatusService {
                     slot,
                     transactions,
                     commit_results,
-                    balances: _,
-                    token_balances: _,
+                    balances,
+                    token_balances,
                     costs,
                     transaction_indexes,
                 },
@@ -147,9 +147,22 @@ impl TransactionStatusService {
                     None
                 };
 
-                for (transaction, commit_result, cost, transaction_index) in izip!(
+                for (
+                    transaction,
+                    commit_result,
+                    pre_balances,
+                    post_balances,
+                    pre_token_balances,
+                    post_token_balances,
+                    cost,
+                    transaction_index,
+                ) in izip!(
                     transactions,
                     commit_results,
+                    balances.pre_balances,
+                    balances.post_balances,
+                    token_balances.pre_token_balances,
+                    token_balances.post_token_balances,
                     costs,
                     transaction_indexes,
                 ) {
@@ -172,25 +185,31 @@ impl TransactionStatusService {
                         map_inner_instructions(inner_instructions).collect()
                     });
 
+                    let pre_token_balances = Some(pre_token_balances);
+                    let post_token_balances = Some(post_token_balances);
+                    let rewards = Some(vec![]);
                     let loaded_addresses = transaction.get_loaded_addresses();
                     let mut transaction_status_meta = TransactionStatusMeta {
                         status,
                         fee,
+                        pre_balances,
+                        post_balances,
                         inner_instructions,
                         log_messages,
+                        pre_token_balances,
+                        post_token_balances,
+                        rewards,
                         loaded_addresses,
                         return_data,
                         compute_units_consumed: Some(executed_units),
                         cost_units: cost,
-                        ..Default::default()
                     };
 
                     if let Some(transaction_notifier) = transaction_notifier.as_ref() {
                         let is_vote = transaction.is_simple_vote_transaction();
                         let message_hash = transaction.message_hash();
                         let signature = transaction.signature();
-                        // Only clone to VersionedTransaction when notifier exists
-                        let versioned_tx = transaction.to_versioned_transaction();
+                        let transaction = transaction.to_versioned_transaction();
                         transaction_notifier.notify_transaction(
                             slot,
                             transaction_index,
@@ -198,7 +217,7 @@ impl TransactionStatusService {
                             message_hash,
                             is_vote,
                             &transaction_status_meta,
-                            &versioned_tx,
+                            &transaction,
                         );
                     }
 
@@ -209,10 +228,15 @@ impl TransactionStatusService {
                     }
 
                     if let Some(batch) = status_and_memos_batch.as_mut() {
-                        // Skip memo extraction - not needed for getSignaturesForAddress
-                        // (memo field will be None in response)
+                        if let Some(memos) = extract_and_fmt_memos(transaction.message()) {
+                            blockstore.add_transaction_memos_to_batch(
+                                transaction.signature(),
+                                slot,
+                                memos,
+                                batch,
+                            )?;
+                        }
 
-                        // Cache message reference to avoid repeated calls
                         let message = transaction.message();
                         let keys_with_writable = message
                             .account_keys()
@@ -264,9 +288,8 @@ impl TransactionStatusService {
                 keyed_rewards,
                 num_partitions,
             } = rewards;
-            let commission_rate_in_basis_points = bank
-                .feature_set
-                .is_active(&agave_feature_set::commission_rate_in_basis_points::id());
+            let commission_rate_in_basis_points =
+                bank.feature_set.snapshot().commission_rate_in_basis_points;
             let rewards = keyed_rewards
                 .into_iter()
                 .map(|(pubkey, reward_info)| Reward {
@@ -669,95 +692,6 @@ pub(crate) mod tests {
         assert_eq!(
             expected_transaction2.message_hash(),
             &result2.transaction.message.hash(),
-        );
-    }
-
-    #[test]
-    fn test_address_signatures_with_empty_balances() {
-        // Tests that address signatures are recorded even when balance vectors are empty
-        // (simulating the latency optimization where balance recording is disabled)
-
-        let (transaction_status_sender, transaction_status_receiver) = unbounded();
-        let ledger_path = get_tmp_ledger_path_auto_delete!();
-        let blockstore = Blockstore::open(ledger_path.path())
-            .expect("Expected to be able to open database ledger");
-        let blockstore = Arc::new(blockstore);
-
-        let transaction = build_test_transaction_legacy();
-        let transaction = VersionedTransaction::from(transaction);
-        let transaction = SanitizedTransaction::try_create(
-            transaction,
-            MessageHash::Compute,
-            None,
-            SimpleAddressLoader::Disabled,
-            &ReservedAccountKeys::empty_key_set(),
-        )
-        .unwrap();
-
-        let signature = *transaction.signature();
-
-        let commit_result = Ok(CommittedTransaction {
-            status: Ok(()),
-            log_messages: None,
-            inner_instructions: None,
-            return_data: None,
-            executed_units: 0,
-            fee_details: FeeDetails::default(),
-            loaded_account_stats: TransactionLoadedAccountsStats::default(),
-            fee_payer_post_balance: 0,
-        });
-
-        // Empty balances - simulating disabled balance recording
-        let balances = TransactionBalancesSet {
-            pre_balances: vec![],
-            post_balances: vec![],
-        };
-        let token_balances = TransactionTokenBalancesSet {
-            pre_token_balances: vec![],
-            post_token_balances: vec![],
-        };
-
-        let slot = 42;
-        let transaction_index = 0;
-        let transaction_status_batch = TransactionStatusBatch {
-            slot,
-            transactions: vec![transaction],
-            commit_results: vec![commit_result],
-            balances,
-            token_balances,
-            costs: vec![Some(100)],
-            transaction_indexes: vec![transaction_index],
-        };
-
-        let exit = Arc::new(AtomicBool::new(false));
-        let transaction_status_service = TransactionStatusService::new(
-            transaction_status_receiver,
-            Arc::new(AtomicU64::default()),
-            true, // enable_rpc_transaction_history
-            None, // no notifier
-            blockstore.clone(),
-            false,
-            None,
-            exit.clone(),
-        );
-
-        transaction_status_sender
-            .send(TransactionStatusMessage::Batch((
-                transaction_status_batch,
-                None,
-            )))
-            .unwrap();
-
-        transaction_status_service.quiesce_and_join_for_tests(exit);
-
-        // Verify transaction status was recorded (proves the loop ran)
-        let tx_status = blockstore
-            .read_transaction_status((signature, slot))
-            .unwrap();
-
-        assert!(
-            tx_status.is_some(),
-            "Transaction status should be recorded even with empty balance vectors"
         );
     }
 }

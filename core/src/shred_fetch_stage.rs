@@ -10,16 +10,16 @@ use {
     solana_epoch_schedule::EpochSchedule,
     solana_gossip::cluster_info::ClusterInfo,
     solana_keypair::Keypair,
-    solana_ledger::{
-        fetch_stage_tracer::{FetchStageArrival, FetchStageArrivalSender},
-        shred::{self, should_discard_shred, wire, ShredFetchStats},
-    },
+    solana_ledger::shred::{self, ShredFetchStats, should_discard_shred},
     solana_packet::{Meta, PACKET_DATA_SIZE},
     solana_perf::packet::{
         BytesPacket, BytesPacketBatch, PacketBatch, PacketBatchRecycler, PacketFlags, PacketRef,
     },
     solana_pubkey::Pubkey,
-    solana_runtime::bank_forks::{BankForks, SharableBanks},
+    solana_runtime::{
+        bank::Bank,
+        bank_forks::{BankForks, SharableBanks},
+    },
     solana_streamer::{
         evicting_sender::EvictingSender,
         streamer::{self, ChannelSend, PacketBatchReceiver, StreamerReceiveStats},
@@ -34,13 +34,6 @@ use {
         time::{Duration, Instant},
     },
 };
-
-// When running with very short epochs (e.g. for testing), we want to avoid
-// filtering out shreds that we actually need. This value was chosen empirically
-// because it's large enough to protect against observed short epoch problems
-// while being small enough to keep the overhead small on deduper, blockstore,
-// etc.
-const MAX_SHRED_DISTANCE_MINIMUM: u64 = 500;
 
 pub(crate) struct ShredFetchStage {
     thread_hdls: Vec<JoinHandle<()>>,
@@ -61,89 +54,75 @@ struct RepairContext {
     outstanding_repair_requests: Arc<RwLock<OutstandingShredRepairs>>,
 }
 
+struct ShredFilterContext {
+    last_updated: Instant,
+    last_root: u64,
+    slots_per_epoch: u64,
+    feature_set: Arc<FeatureSet>,
+    epoch_schedule: EpochSchedule,
+    keypair: Option<Arc<Keypair>>,
+}
+
+impl ShredFilterContext {
+    // When running with very short epochs (e.g. for testing), we want to avoid
+    // filtering out shreds that we actually need. This value was chosen empirically
+    // because it's large enough to protect against observed short epoch problems
+    // while being small enough to keep the overhead small on deduper, blockstore,
+    // etc.
+    const MAX_SHRED_DISTANCE_MINIMUM: u64 = 500;
+
+    fn new(root_bank: Arc<Bank>, repair_context: Option<&RepairContext>) -> ShredFilterContext {
+        Self {
+            last_updated: Instant::now(),
+            last_root: root_bank.slot(),
+            slots_per_epoch: root_bank.get_slots_in_epoch(root_bank.epoch()),
+            feature_set: root_bank.feature_set.clone(),
+            epoch_schedule: root_bank.epoch_schedule().clone(),
+            keypair: repair_context.as_ref().copied().map(RepairContext::keypair),
+        }
+    }
+
+    fn maybe_update(&mut self, root_bank: Arc<Bank>, repair_context: Option<&RepairContext>) {
+        if self.last_updated.elapsed().as_millis() as u64 > DEFAULT_MS_PER_SLOT {
+            *self = Self::new(root_bank, repair_context);
+        }
+    }
+
+    fn max_slot(&self) -> u64 {
+        self.last_root + Self::MAX_SHRED_DISTANCE_MINIMUM.max(2 * self.slots_per_epoch)
+    }
+}
+
 impl ShredFetchStage {
     // updates packets received on a channel and sends them on another channel
     fn modify_packets(
         recvr: PacketBatchReceiver,
-        _recvr_stats: Option<Arc<StreamerReceiveStats>>,
+        recvr_stats: Option<Arc<StreamerReceiveStats>>,
         sendr: EvictingSender<PacketBatch>,
         sharable_banks: &SharableBanks,
         shred_version: u16,
-        _name: &'static str,
+        name: &'static str,
         flags: PacketFlags,
         repair_context: Option<&RepairContext>,
         turbine_disabled: Arc<AtomicBool>,
-        fetch_stage_tracer: Option<FetchStageArrivalSender>,
     ) {
         // Only repair shreds need repair context.
         debug_assert_eq!(
             flags.contains(PacketFlags::REPAIR),
             repair_context.is_some()
         );
-        // LATENCY OPTIMIZATION: Stats submission disabled, constant unused.
-        // const STATS_SUBMIT_CADENCE: Duration = Duration::from_secs(1);
-        let mut last_updated = Instant::now();
-        let mut keypair = repair_context.as_ref().copied().map(RepairContext::keypair);
-        let (mut last_root, mut slots_per_epoch, mut feature_set, mut epoch_schedule) = {
-            let root_bank = sharable_banks.root();
-            (
-                root_bank.slot(),
-                root_bank.get_slots_in_epoch(root_bank.epoch()),
-                root_bank.feature_set.clone(),
-                root_bank.epoch_schedule().clone(),
-            )
-        };
+        const STATS_SUBMIT_CADENCE: Duration = Duration::from_secs(1);
+        let mut shred_filter_ctx = ShredFilterContext::new(sharable_banks.root(), repair_context);
         let mut stats = ShredFetchStats::default();
 
         for mut packet_batch in recvr {
-            // Capture arrival timestamp for tracing (before any processing)
-            if let Some(ref tracer) = fetch_stage_tracer {
-                let is_repair = flags.contains(PacketFlags::REPAIR);
-
-                for packet in packet_batch.iter() {
-                    if packet.meta().discard() {
-                        continue;
-                    }
-                    let meta = packet.meta();
-                    // Try to parse shred header for slot/index
-                    let (slot, shred_index) = packet
-                        .data(..)
-                        .and_then(|data| {
-                            let slot = wire::get_slot(data);
-                            let index = wire::get_index(data);
-                            Some((slot, index))
-                        })
-                        .unwrap_or((None, None));
-
-                    tracer.record(FetchStageArrival::new(
-                        slot,
-                        shred_index,
-                        None, // is_data - determined later in sigverify
-                        meta.addr,
-                        meta.port,
-                        meta.size,
-                        is_repair,
-                        false, // is_quic - this is the UDP path
-                    ));
-                }
-            }
-
-            if last_updated.elapsed().as_millis() as u64 > DEFAULT_MS_PER_SLOT {
-                last_updated = Instant::now();
-                let root_bank = sharable_banks.root();
-                feature_set = root_bank.feature_set.clone();
-                epoch_schedule = root_bank.epoch_schedule().clone();
-                last_root = root_bank.slot();
-                slots_per_epoch = root_bank.get_slots_in_epoch(root_bank.epoch());
-                keypair = repair_context.as_ref().copied().map(RepairContext::keypair);
-            }
-            // LATENCY OPTIMIZATION: Skip stats collection for read-only validator.
-            // stats.shred_count += packet_batch.len();
+            shred_filter_ctx.maybe_update(sharable_banks.root(), repair_context);
+            stats.shred_count += packet_batch.len();
 
             if let Some(repair_context) = repair_context {
                 debug_assert_eq!(flags, PacketFlags::REPAIR);
-                debug_assert!(keypair.is_some());
-                if let Some(ref keypair) = keypair {
+                debug_assert!(shred_filter_ctx.keypair.is_some());
+                if let Some(ref keypair) = shred_filter_ctx.keypair {
                     ServeRepair::handle_repair_response_pings(
                         &repair_context.repair_socket,
                         keypair,
@@ -162,7 +141,6 @@ impl ShredFetchStage {
                         // Have to set repair flag here so that the nonce is
                         // taken off the shred's payload.
                         packet.meta_mut().flags |= PacketFlags::REPAIR;
-                        // do we really need this, can we remove this?
                         if !verify_repair_nonce(
                             packet.as_ref(),
                             now,
@@ -175,22 +153,21 @@ impl ShredFetchStage {
 
             // Filter out shreds that are way too far in the future to avoid the
             // overhead of having to hold onto them.
-            let max_slot = last_root + MAX_SHRED_DISTANCE_MINIMUM.max(2 * slots_per_epoch);
+            let max_slot = shred_filter_ctx.max_slot();
             let discard_unexpected_data_complete_shreds = |shred_slot| {
                 check_feature_activation(
                     &agave_feature_set::discard_unexpected_data_complete_shreds::id(),
                     shred_slot,
-                    &feature_set,
-                    &epoch_schedule,
+                    &shred_filter_ctx.feature_set,
+                    &shred_filter_ctx.epoch_schedule,
                 )
             };
             let turbine_disabled = turbine_disabled.load(Ordering::Relaxed);
             for mut packet in packet_batch.iter_mut().filter(|p| !p.meta().discard()) {
-                // lets track the discard reasons for the packets
                 if turbine_disabled
                     || should_discard_shred(
                         packet.as_ref(),
-                        last_root,
+                        shred_filter_ctx.last_root,
                         max_slot,
                         shred_version,
                         discard_unexpected_data_complete_shreds,
@@ -202,19 +179,15 @@ impl ShredFetchStage {
                     packet.meta_mut().flags.insert(flags);
                 }
             }
-            // LATENCY OPTIMIZATION: Skip stats submission for read-only validator.
-            // if stats.maybe_submit(name, STATS_SUBMIT_CADENCE) {
-            //     if let Some(stats) = recvr_stats.as_ref() {
-            //         stats.report();
-            //     }
-            // }
+            if stats.maybe_submit(name, STATS_SUBMIT_CADENCE) {
+                if let Some(stats) = recvr_stats.as_ref() {
+                    stats.report();
+                }
+            }
             if let Err(send_err) = sendr.try_send(packet_batch) {
                 match send_err {
-                    crossbeam_channel::TrySendError::Full(_v) => {
-                        datapoint_info!(
-                            "shred_fetch_stage_channel_full",
-                            ("channel_size", SHRED_FETCH_CHANNEL_SIZE, i64)
-                        );
+                    crossbeam_channel::TrySendError::Full(v) => {
+                        stats.overflow_shreds += v.len();
                     }
                     _ => unreachable!("EvictingSender holds on to both ends of the channel"),
                 }
@@ -237,7 +210,6 @@ impl ShredFetchStage {
         flags: PacketFlags,
         repair_context: Option<RepairContext>,
         turbine_disabled: Arc<AtomicBool>,
-        fetch_stage_tracer: Option<FetchStageArrivalSender>,
     ) -> (Vec<JoinHandle<()>>, JoinHandle<()>) {
         let sharable_banks = bank_forks.read().unwrap().sharable_banks();
         let (packet_sender, packet_receiver) =
@@ -254,9 +226,9 @@ impl ShredFetchStage {
                     packet_sender.clone(),
                     recycler.clone(),
                     receiver_stats.clone(),
-                    Some(Duration::from_micros(10)), // coalesce - reduced for lower latency
-                    true,                            // use_pinned_memory
-                    false,                           // is_staked_service
+                    Some(Duration::from_millis(5)), // coalesce
+                    true,                           // use_pinned_memory
+                    false,                          // is_staked_service
                 )
             })
             .collect();
@@ -273,7 +245,6 @@ impl ShredFetchStage {
                     flags,
                     repair_context.as_ref(),
                     turbine_disabled,
-                    fetch_stage_tracer,
                 )
             })
             .unwrap();
@@ -284,7 +255,6 @@ impl ShredFetchStage {
     pub(crate) fn new(
         sockets: Vec<Arc<UdpSocket>>,
         repair_response_quic_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
-        turbine_quic_endpoint_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
         repair_socket: Arc<UdpSocket>,
         sender: EvictingSender<PacketBatch>,
         shred_version: u16,
@@ -293,7 +263,6 @@ impl ShredFetchStage {
         outstanding_repair_requests: Arc<RwLock<OutstandingShredRepairs>>,
         turbine_disabled: Arc<AtomicBool>,
         exit: Arc<AtomicBool>,
-        fetch_stage_tracer: Option<FetchStageArrivalSender>,
     ) -> Self {
         let recycler = PacketBatchRecycler::warmed(100, 1024);
         let repair_context = RepairContext {
@@ -316,7 +285,6 @@ impl ShredFetchStage {
             PacketFlags::empty(),
             None, // repair_context
             turbine_disabled.clone(),
-            fetch_stage_tracer.clone(),
         );
 
         let (repair_receiver, repair_handler) = Self::packet_modifier(
@@ -333,7 +301,6 @@ impl ShredFetchStage {
             PacketFlags::REPAIR,
             Some(repair_context.clone()),
             turbine_disabled.clone(),
-            fetch_stage_tracer.clone(),
         );
 
         tvu_threads.extend(repair_receiver);
@@ -342,11 +309,6 @@ impl ShredFetchStage {
         // Repair shreds fetched over QUIC protocol.
         {
             let (packet_sender, packet_receiver) = unbounded();
-            let bank_forks = bank_forks.clone();
-            let exit = exit.clone();
-            let sender = sender.clone();
-            let turbine_disabled = turbine_disabled.clone();
-            let fetch_stage_tracer_clone = fetch_stage_tracer.clone();
             tvu_threads.extend([
                 Builder::new()
                     .name("solTvuRecvRpr".to_string())
@@ -374,45 +336,11 @@ impl ShredFetchStage {
                             // No ping packets but need to verify repair nonce.
                             Some(&repair_context),
                             turbine_disabled,
-                            fetch_stage_tracer_clone,
                         )
                     })
                     .unwrap(),
             ]);
         }
-        // Turbine shreds fetched over QUIC protocol.
-        let (packet_sender, packet_receiver) = unbounded();
-        tvu_threads.extend([
-            Builder::new()
-                .name("solTvuRecvQuic".to_string())
-                .spawn(|| {
-                    receive_quic_datagrams(
-                        turbine_quic_endpoint_receiver,
-                        PacketFlags::empty(),
-                        packet_sender,
-                        exit,
-                    )
-                })
-                .unwrap(),
-            Builder::new()
-                .name("solTvuFetchQuic".to_string())
-                .spawn(move || {
-                    let sharable_banks = bank_forks.read().unwrap().sharable_banks();
-                    Self::modify_packets(
-                        packet_receiver,
-                        None,
-                        sender,
-                        &sharable_banks,
-                        shred_version,
-                        "shred_fetch_quic",
-                        PacketFlags::empty(),
-                        None, // repair_context
-                        turbine_disabled,
-                        fetch_stage_tracer,
-                    )
-                })
-                .unwrap(),
-        ]);
         Self {
             thread_hdls: tvu_threads,
         }
@@ -448,10 +376,6 @@ fn verify_repair_nonce(
         .is_some()
 }
 
-/// Bit flag used to mark packets that arrived via QUIC (as opposed to UDP).
-/// Uses UNUSED_0 (0x10) from PacketFlags which is explicitly reserved for reuse.
-const QUIC_ORIGIN_FLAG: u8 = 0b0001_0000;
-
 pub(crate) fn receive_quic_datagrams(
     quic_datagrams_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
     flags: PacketFlags,
@@ -459,7 +383,7 @@ pub(crate) fn receive_quic_datagrams(
     exit: Arc<AtomicBool>,
 ) {
     const RECV_TIMEOUT: Duration = Duration::from_secs(1);
-    const PACKET_COALESCE_DURATION: Duration = Duration::from_micros(10);
+    const PACKET_COALESCE_DURATION: Duration = Duration::from_millis(1);
     while !exit.load(Ordering::Relaxed) {
         let entry = match quic_datagrams_receiver.recv_timeout(RECV_TIMEOUT) {
             Ok(entry) => entry,
@@ -478,8 +402,7 @@ pub(crate) fn receive_quic_datagrams(
                 meta.size = bytes.len();
                 meta.addr = addr.ip();
                 meta.port = addr.port();
-                // Set both the passed flags and the QUIC origin flag
-                meta.flags = PacketFlags::from_bits_truncate(flags.bits() | QUIC_ORIGIN_FLAG);
+                meta.flags = flags;
                 BytesPacket::new(bytes, meta)
             })
             .collect();

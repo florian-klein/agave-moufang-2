@@ -6,7 +6,7 @@ use {
     solana_program_entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, NON_DUP_MARKER},
     solana_pubkey::Pubkey,
     solana_sbpf::{
-        aligned_memory::Pod,
+        aligned_memory::{AlignedMemory, Pod},
         ebpf::{HOST_ALIGN, MM_INPUT_START},
         memory_region::MemoryRegion,
     },
@@ -18,146 +18,6 @@ use {
     },
     std::mem::{self, size_of},
 };
-
-/// A reusable aligned memory buffer that supports `reset()` for pooling.
-/// Unlike `AlignedMemory` from sbpf, this buffer can be reset to length 0
-/// while retaining its allocation for reuse.
-pub struct PooledAlignedBuffer {
-    ptr: *mut u8,
-    len: usize,
-    capacity: usize,
-}
-
-// SAFETY: The buffer owns its allocation exclusively, like Vec<u8>.
-unsafe impl Send for PooledAlignedBuffer {}
-
-impl Drop for PooledAlignedBuffer {
-    fn drop(&mut self) {
-        if self.capacity > 0 {
-            unsafe {
-                let layout =
-                    std::alloc::Layout::from_size_align_unchecked(self.capacity, HOST_ALIGN);
-                std::alloc::dealloc(self.ptr, layout);
-            }
-        }
-    }
-}
-
-impl PooledAlignedBuffer {
-    /// Create a new buffer with the given capacity, aligned to HOST_ALIGN.
-    pub fn with_capacity(capacity: usize) -> Self {
-        if capacity == 0 {
-            return Self {
-                ptr: HOST_ALIGN as *mut u8, // dangling aligned pointer
-                len: 0,
-                capacity: 0,
-            };
-        }
-        unsafe {
-            let layout = std::alloc::Layout::from_size_align(capacity, HOST_ALIGN)
-                .expect("invalid layout");
-            let ptr = std::alloc::alloc(layout);
-            if ptr.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-            Self {
-                ptr,
-                len: 0,
-                capacity,
-            }
-        }
-    }
-
-    /// Reset length to 0, keeping the allocation for reuse.
-    pub fn reset(&mut self) {
-        self.len = 0;
-    }
-
-    /// Ensure capacity is at least `min_capacity`. If not, reallocate.
-    pub fn ensure_capacity(&mut self, min_capacity: usize) {
-        if self.capacity >= min_capacity {
-            self.len = 0;
-            return;
-        }
-        // Need a bigger buffer - deallocate old and allocate new
-        if self.capacity > 0 {
-            unsafe {
-                let layout =
-                    std::alloc::Layout::from_size_align_unchecked(self.capacity, HOST_ALIGN);
-                std::alloc::dealloc(self.ptr, layout);
-            }
-        }
-        if min_capacity == 0 {
-            self.ptr = HOST_ALIGN as *mut u8;
-            self.len = 0;
-            self.capacity = 0;
-            return;
-        }
-        unsafe {
-            let layout = std::alloc::Layout::from_size_align(min_capacity, HOST_ALIGN)
-                .expect("invalid layout");
-            let ptr = std::alloc::alloc(layout);
-            if ptr.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-            self.ptr = ptr;
-            self.len = 0;
-            self.capacity = min_capacity;
-        }
-    }
-
-    #[inline(always)]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline(always)]
-    pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-    }
-
-    #[inline(always)]
-    pub fn as_slice_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
-    }
-
-    /// Grow the buffer by `num` bytes filled with `value`.
-    pub fn fill_write(&mut self, num: usize, value: u8) -> std::io::Result<()> {
-        let new_len = self.len + num;
-        if new_len > self.capacity {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "pooled buffer fill_write overflow",
-            ));
-        }
-        unsafe {
-            std::ptr::write_bytes(self.ptr.add(self.len), value, num);
-        }
-        self.len = new_len;
-        Ok(())
-    }
-
-    /// Write a Pod value. Caller must ensure capacity is sufficient.
-    #[inline(always)]
-    pub unsafe fn write_unchecked<T: Pod>(&mut self, value: T) {
-        let size = mem::size_of::<T>();
-        debug_assert!(self.len + size <= self.capacity);
-        unsafe {
-            (self.ptr.add(self.len) as *mut T).write_unaligned(value);
-        }
-        self.len += size;
-    }
-
-    /// Write a byte slice. Caller must ensure capacity is sufficient.
-    #[inline(always)]
-    pub unsafe fn write_all_unchecked(&mut self, value: &[u8]) {
-        debug_assert!(self.len + value.len() <= self.capacity);
-        unsafe {
-            std::ptr::copy_nonoverlapping(value.as_ptr(), self.ptr.add(self.len), value.len());
-        }
-        self.len += value.len();
-    }
-}
 
 /// Modifies the memory mapping in serialization and CPI return for virtual_address_space_adjustments
 pub fn modify_memory_region_of_account(
@@ -198,7 +58,7 @@ enum SerializeAccount<'a, 'ix_data> {
 }
 
 struct Serializer {
-    buffer: PooledAlignedBuffer,
+    buffer: AlignedMemory<HOST_ALIGN>,
     regions: Vec<MemoryRegion>,
     vaddr: u64,
     region_start: usize,
@@ -216,50 +76,8 @@ impl Serializer {
         account_data_direct_mapping: bool,
     ) -> Serializer {
         Serializer {
-            buffer: PooledAlignedBuffer::with_capacity(size),
+            buffer: AlignedMemory::with_capacity(size),
             regions: Vec::new(),
-            region_start: 0,
-            vaddr: start_addr,
-            is_loader_v1,
-            virtual_address_space_adjustments,
-            account_data_direct_mapping,
-        }
-    }
-
-    fn new_with_buffer(
-        mut buffer: PooledAlignedBuffer,
-        size: usize,
-        start_addr: u64,
-        is_loader_v1: bool,
-        virtual_address_space_adjustments: bool,
-        account_data_direct_mapping: bool,
-    ) -> Serializer {
-        buffer.ensure_capacity(size);
-        Serializer {
-            buffer,
-            regions: Vec::new(),
-            region_start: 0,
-            vaddr: start_addr,
-            is_loader_v1,
-            virtual_address_space_adjustments,
-            account_data_direct_mapping,
-        }
-    }
-
-    fn new_with_buffer_and_regions(
-        mut buffer: PooledAlignedBuffer,
-        mut regions: Vec<MemoryRegion>,
-        size: usize,
-        start_addr: u64,
-        is_loader_v1: bool,
-        virtual_address_space_adjustments: bool,
-        account_data_direct_mapping: bool,
-    ) -> Serializer {
-        buffer.ensure_capacity(size);
-        regions.clear();
-        Serializer {
-            buffer,
-            regions,
             region_start: 0,
             vaddr: start_addr,
             is_loader_v1,
@@ -381,7 +199,7 @@ impl Serializer {
         self.vaddr += range.len() as u64;
     }
 
-    fn finish(mut self) -> (PooledAlignedBuffer, Vec<MemoryRegion>) {
+    fn finish(mut self) -> (AlignedMemory<HOST_ALIGN>, Vec<MemoryRegion>) {
         self.push_region();
         debug_assert_eq!(self.region_start, self.buffer.len());
         (self.buffer, self.regions)
@@ -408,33 +226,7 @@ pub fn serialize_parameters(
     direct_account_pointers_in_program_input: bool,
 ) -> Result<
     (
-        PooledAlignedBuffer,
-        Vec<MemoryRegion>,
-        Vec<SerializedAccountMetadata>,
-        usize,
-    ),
-    InstructionError,
-> {
-    serialize_parameters_with_buffer(
-        instruction_context,
-        virtual_address_space_adjustments,
-        account_data_direct_mapping,
-        None,
-        None,
-        None,
-    )
-}
-
-pub fn serialize_parameters_with_buffer(
-    instruction_context: &InstructionContext,
-    virtual_address_space_adjustments: bool,
-    account_data_direct_mapping: bool,
-    reuse_buffer: Option<PooledAlignedBuffer>,
-    reuse_regions: Option<Vec<MemoryRegion>>,
-    reuse_acct_metadata: Option<Vec<SerializedAccountMetadata>>,
-) -> Result<
-    (
-        PooledAlignedBuffer,
+        AlignedMemory<HOST_ALIGN>,
         Vec<MemoryRegion>,
         Vec<SerializedAccountMetadata>,
         usize,
@@ -478,9 +270,6 @@ pub fn serialize_parameters_with_buffer(
             &program_id,
             virtual_address_space_adjustments,
             account_data_direct_mapping,
-            reuse_buffer,
-            reuse_regions,
-            reuse_acct_metadata,
         )
     } else {
         // Used by loader-v2 (bpf_loader) and loader-v3 (bpf_loader_upgradeable)
@@ -490,9 +279,8 @@ pub fn serialize_parameters_with_buffer(
             &program_id,
             virtual_address_space_adjustments,
             account_data_direct_mapping,
-            reuse_buffer,
-            reuse_regions,
-            reuse_acct_metadata,
+            // SIMD-0449: only available on ABIv1
+            direct_account_pointers_in_program_input,
         )
     }
 }
@@ -534,12 +322,9 @@ fn serialize_parameters_for_abiv0(
     program_id: &Pubkey,
     virtual_address_space_adjustments: bool,
     account_data_direct_mapping: bool,
-    reuse_buffer: Option<PooledAlignedBuffer>,
-    reuse_regions: Option<Vec<MemoryRegion>>,
-    reuse_acct_metadata: Option<Vec<SerializedAccountMetadata>>,
 ) -> Result<
     (
-        PooledAlignedBuffer,
+        AlignedMemory<HOST_ALIGN>,
         Vec<MemoryRegion>,
         Vec<SerializedAccountMetadata>,
         usize,
@@ -571,28 +356,15 @@ fn serialize_parameters_for_abiv0(
          + instruction_data.len() // instruction data
          + size_of::<Pubkey>(); // program id
 
-    let mut s = match (reuse_buffer, reuse_regions) {
-        (Some(buf), Some(regions)) => Serializer::new_with_buffer_and_regions(
-            buf, regions, size, MM_INPUT_START, true,
-            virtual_address_space_adjustments, account_data_direct_mapping,
-        ),
-        (Some(buf), None) => Serializer::new_with_buffer(
-            buf, size, MM_INPUT_START, true,
-            virtual_address_space_adjustments, account_data_direct_mapping,
-        ),
-        _ => Serializer::new(
-            size, MM_INPUT_START, true,
-            virtual_address_space_adjustments, account_data_direct_mapping,
-        ),
-    };
+    let mut s = Serializer::new(
+        size,
+        MM_INPUT_START,
+        true,
+        virtual_address_space_adjustments,
+        account_data_direct_mapping,
+    );
 
-    let mut accounts_metadata: Vec<SerializedAccountMetadata> = if let Some(mut v) = reuse_acct_metadata {
-        v.clear();
-        v.reserve(accounts.len().saturating_sub(v.capacity()));
-        v
-    } else {
-        Vec::with_capacity(accounts.len())
-    };
+    let mut accounts_metadata: Vec<SerializedAccountMetadata> = Vec::with_capacity(accounts.len());
     s.write::<u64>((accounts.len() as u64).to_le());
     for account in accounts {
         match account {
@@ -704,25 +476,17 @@ fn serialize_parameters_for_abiv1(
     program_id: &Pubkey,
     virtual_address_space_adjustments: bool,
     account_data_direct_mapping: bool,
-    reuse_buffer: Option<PooledAlignedBuffer>,
-    reuse_regions: Option<Vec<MemoryRegion>>,
-    reuse_acct_metadata: Option<Vec<SerializedAccountMetadata>>,
+    direct_account_pointers_program_input: bool,
 ) -> Result<
     (
-        PooledAlignedBuffer,
+        AlignedMemory<HOST_ALIGN>,
         Vec<MemoryRegion>,
         Vec<SerializedAccountMetadata>,
         usize,
     ),
     InstructionError,
 > {
-    let mut accounts_metadata = if let Some(mut v) = reuse_acct_metadata {
-        v.clear();
-        v.reserve(accounts.len().saturating_sub(v.capacity()));
-        v
-    } else {
-        Vec::with_capacity(accounts.len())
-    };
+    let mut accounts_metadata = Vec::with_capacity(accounts.len());
     // Calculate size in order to alloc once
     let mut size = size_of::<u64>();
     for account in &accounts {
@@ -754,20 +518,22 @@ fn serialize_parameters_for_abiv1(
     + instruction_data.len()
     + size_of::<Pubkey>(); // program id;
 
-    let mut s = match (reuse_buffer, reuse_regions) {
-        (Some(buf), Some(regions)) => Serializer::new_with_buffer_and_regions(
-            buf, regions, size, MM_INPUT_START, false,
-            virtual_address_space_adjustments, account_data_direct_mapping,
-        ),
-        (Some(buf), None) => Serializer::new_with_buffer(
-            buf, size, MM_INPUT_START, false,
-            virtual_address_space_adjustments, account_data_direct_mapping,
-        ),
-        _ => Serializer::new(
-            size, MM_INPUT_START, false,
-            virtual_address_space_adjustments, account_data_direct_mapping,
-        ),
+    // reserve space for account pointer array if SIMD-0449 is enabled
+    let account_pointers_offset = if direct_account_pointers_program_input {
+        let offset = (size as *const u8).align_offset(BPF_ALIGN_OF_U128);
+        size += offset + accounts.len() * size_of::<u64>();
+        Some(offset)
+    } else {
+        None
     };
+
+    let mut s = Serializer::new(
+        size,
+        MM_INPUT_START,
+        false,
+        virtual_address_space_adjustments,
+        account_data_direct_mapping,
+    );
 
     // Serialize into the buffer
     s.write::<u64>((accounts.len() as u64).to_le());
@@ -805,6 +571,16 @@ fn serialize_parameters_for_abiv1(
     s.write::<u64>((instruction_data.len() as u64).to_le());
     let instruction_data_offset = s.write_all(instruction_data);
     s.write_all(program_id.as_ref());
+
+    if let Some(offset) = account_pointers_offset {
+        // Add padding before the account pointer array to reach 8-byte alignment
+        // (BPF_ALIGN_OF_U128).
+        s.fill_write(offset, 0)
+            .map_err(|_| InstructionError::InvalidArgument)?;
+        for entry in accounts_metadata.iter() {
+            s.write::<u64>(entry.vm_data_addr.to_le());
+        }
+    }
 
     let (mem, regions) = s.finish();
     Ok((
@@ -871,7 +647,6 @@ fn deserialize_parameters_for_abiv1<I: IntoIterator<Item = usize>>(
                     .get(start..start + post_len)
                     .ok_or(InstructionError::InvalidArgument)?;
                 // The redundant check helps to avoid the expensive data comparison if we can
-                // The redundant check helps to avoid the expensive data comparison if we can
                 match borrowed_account.can_data_be_resized(post_len) {
                     Ok(()) => borrowed_account.set_data_from_slice(data)?,
                     Err(err) if borrowed_account.get_data() != data => return Err(err),
@@ -915,10 +690,7 @@ mod tests {
         solana_account_info::AccountInfo,
         solana_program_entrypoint::deserialize,
         solana_rent::Rent,
-        solana_sbpf::{
-            aligned_memory::AlignedMemory, memory_region::MemoryMapping, program::SBPFVersion,
-            vm::Config,
-        },
+        solana_sbpf::{memory_region::MemoryMapping, program::SBPFVersion, vm::Config},
         solana_sdk_ids::bpf_loader,
         solana_system_interface::MAX_PERMITTED_ACCOUNTS_DATA_ALLOCATIONS_PER_TRANSACTION,
         solana_transaction_context::{
@@ -1032,7 +804,7 @@ mod tests {
                     // Special case implementation of configure_next_instruction_for_tests()
                     // which avoids the overflow when constructing the dedup_map
                     // by simply not filling it.
-                    let dedup_map = Box::new([u16::MAX; MAX_ACCOUNTS_PER_TRANSACTION]);
+                    let dedup_map = vec![u16::MAX; MAX_ACCOUNTS_PER_TRANSACTION];
                     invoke_context
                         .transaction_context
                         .configure_instruction_at_index(

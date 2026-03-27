@@ -42,7 +42,7 @@ use {
         vote_history_storage::{NullVoteHistoryStorage, VoteHistoryStorage},
         voting_service::VotingServiceOverride,
     },
-    agave_xdp::xdp_retransmitter::{XdpRetransmitBuilder, XdpRetransmitter},
+    agave_xdp::transmitter::{Transmitter, TransmitterBuilder},
     anyhow::{Context, Result, anyhow},
     crossbeam_channel::{Receiver, bounded, unbounded},
     quinn::Endpoint,
@@ -78,7 +78,7 @@ use {
     solana_hard_forks::HardForks,
     solana_hash::Hash,
     solana_keypair::Keypair,
-    solana_leader_schedule::FixedSchedule,
+    solana_leader_schedule::{FixedSchedule, SlotLeader},
     solana_ledger::{
         bank_forks_utils,
         blockstore::{
@@ -88,7 +88,6 @@ use {
         blockstore_metric_report_service::BlockstoreMetricReportService,
         blockstore_options::{BLOCKSTORE_DIRECTORY_ROCKS_LEVEL, BlockstoreOptions},
         blockstore_processor::{self, TransactionStatusSender},
-        dataset_tracking::{TxExecutionCsvWriter, TxExecutionSender},
         entry_notifier_interface::EntryNotifierArc,
         entry_notifier_service::{EntryNotifierSender, EntryNotifierService},
         leader_schedule_cache::LeaderScheduleCache,
@@ -144,7 +143,7 @@ use {
     },
     solana_time_utils::timestamp,
     solana_tpu_client::tpu_client::{DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_VOTE_USE_QUIC},
-    solana_turbine::{self, broadcast_stage::BroadcastStageType},
+    solana_turbine::{self, XdpSender, broadcast_stage::BroadcastStageType},
     solana_unified_scheduler_logic::SchedulingMode,
     solana_unified_scheduler_pool::{DefaultSchedulerPool, SupportedSchedulingMode},
     solana_validator_exit::Exit,
@@ -153,7 +152,7 @@ use {
         borrow::Cow,
         cmp,
         collections::{HashMap, HashSet},
-        net::SocketAddr,
+        net::{SocketAddr, SocketAddrV4},
         num::{NonZeroU64, NonZeroUsize},
         path::{Path, PathBuf},
         str::FromStr,
@@ -212,29 +211,10 @@ pub enum BlockProductionMethod {
     CentralScheduler,
     #[default]
     CentralSchedulerGreedy,
-    UnifiedScheduler,
 }
 
 impl BlockProductionMethod {
-    pub fn cli_names() -> &'static [&'static str] {
-        // Simply return Self::VARIANTS by removing this code block altogether once after
-        // UnifiedScheduler isn't experimental
-        {
-            use std::sync::LazyLock;
-            static VARIANTS_NO_EXPERIMENTAL: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-                BlockProductionMethod::VARIANTS
-                    .iter()
-                    .filter_map(|&variant| (variant != "unified-scheduler").then_some(variant))
-                    .collect()
-            });
-
-            let disable_experimental =
-                std::env::var("SOLANA_ENABLE_EXPERIMENTAL_BLOCK_PRODUCTION_METHOD").is_err();
-            if disable_experimental {
-                return &VARIANTS_NO_EXPERIMENTAL[..];
-            }
-        }
-
+    pub const fn cli_names() -> &'static [&'static str] {
         Self::VARIANTS
     }
 
@@ -314,9 +294,6 @@ pub fn supported_scheduling_mode(
     (verification, production): (&BlockVerificationMethod, &BlockProductionMethod),
 ) -> SupportedSchedulingMode {
     match (verification, production) {
-        (BlockVerificationMethod::UnifiedScheduler, BlockProductionMethod::UnifiedScheduler) => {
-            SupportedSchedulingMode::Both
-        }
         (BlockVerificationMethod::UnifiedScheduler, _) => {
             SupportedSchedulingMode::Either(SchedulingMode::BlockVerification)
         }
@@ -361,12 +338,6 @@ pub struct ValidatorConfig {
     /// Run PoH, transaction signature and other transaction verification during blockstore
     /// processing.
     pub run_verification: bool,
-    /// Enable shred arrival tracing to CSV files.
-    /// When enabled, arrival metadata (timestamp, source IP, source type) is
-    /// captured for each shred and written to CSV when completed data sets are produced.
-    pub shred_arrival_tracing_enabled: bool,
-    /// Directory for shred arrival CSV files.
-    pub shred_arrival_output_dir: PathBuf,
     pub require_tower: bool,
     pub tower_storage: Arc<dyn TowerStorage>,
     pub vote_history_storage: Arc<dyn VoteHistoryStorage>,
@@ -412,7 +383,6 @@ pub struct ValidatorConfig {
     pub delay_leader_block_for_pending_fork: bool,
     pub voting_service_test_override: Option<VotingServiceOverride>,
     pub repair_handler_type: RepairHandlerType,
-    pub shredstream_config: crate::shredstream::ShredstreamConfig,
     // Thread niceness adjustment for snapshot packager service
     pub snapshot_packager_niceness_adj: i8,
 }
@@ -445,9 +415,7 @@ impl ValidatorConfig {
             repair_whitelist: Arc::new(RwLock::new(HashSet::default())),
             gossip_validators: None,
             max_genesis_archive_unpacked_size: MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
-            run_verification: false,
-            shred_arrival_tracing_enabled: false,
-            shred_arrival_output_dir: PathBuf::from("shred_arrivals"),
+            run_verification: true,
             require_tower: false,
             tower_storage: Arc::new(NullTowerStorage::default()),
             vote_history_storage: Arc::new(NullVoteHistoryStorage::default()),
@@ -497,7 +465,6 @@ impl ValidatorConfig {
             delay_leader_block_for_pending_fork: false,
             voting_service_test_override: None,
             repair_handler_type: RepairHandlerType::default(),
-            shredstream_config: crate::shredstream::ShredstreamConfig::default(),
             snapshot_packager_niceness_adj: 0,
         }
     }
@@ -685,12 +652,11 @@ pub struct Validator {
     repair_quic_endpoints: Option<[Endpoint; 3]>,
     repair_quic_endpoints_runtime: Option<TokioRuntime>,
     repair_quic_endpoints_join_handle: Option<repair::quic_endpoint::AsyncTryJoinHandle>,
-    xdp_retransmitter: Option<XdpRetransmitter>,
+    xdp_transmitter: Option<Transmitter>,
     // This runtime is used to run the client owned by SendTransactionService.
     // We don't wait for its JoinHandle here because ownership and shutdown
     // are managed elsewhere. This variable is intentionally unused.
     _tpu_client_next_runtime: Option<TokioRuntime>,
-    shredstream_service: Option<crate::shredstream::ShredstreamService>,
 }
 
 impl Validator {
@@ -709,7 +675,7 @@ impl Validator {
         socket_addr_space: SocketAddrSpace,
         tpu_config: ValidatorTpuConfig,
         admin_rpc_service_post_init: Arc<RwLock<Option<AdminRpcRequestMetadataPostInit>>>,
-        maybe_xdp_retransmit_builder: Option<XdpRetransmitBuilder>,
+        xdp_builder_with_src_addr: Option<(TransmitterBuilder, SocketAddrV4)>,
     ) -> Result<Self> {
         let exit = Arc::new(AtomicBool::new(false));
         Self::new_with_exit(
@@ -726,7 +692,7 @@ impl Validator {
             socket_addr_space,
             tpu_config,
             admin_rpc_service_post_init,
-            maybe_xdp_retransmit_builder,
+            xdp_builder_with_src_addr,
             exit,
         )
     }
@@ -746,7 +712,7 @@ impl Validator {
         socket_addr_space: SocketAddrSpace,
         tpu_config: ValidatorTpuConfig,
         admin_rpc_service_post_init: Arc<RwLock<Option<AdminRpcRequestMetadataPostInit>>>,
-        maybe_xdp_retransmit_builder: Option<XdpRetransmitBuilder>,
+        xdp_builder_with_src_addr: Option<(TransmitterBuilder, SocketAddrV4)>,
         exit: Arc<AtomicBool>,
     ) -> Result<Self> {
         #[cfg(debug_assertions)]
@@ -1109,17 +1075,6 @@ impl Validator {
         }
         let banking_tracer_channels = banking_tracer.create_channels();
 
-        // Create per-transaction execution tracking channel if tracing is enabled.
-        // The sender is shared between the unified scheduler pool (for actual per-tx
-        // timing) and the Tvu (for replay_stage access). The receiver goes to the Tvu
-        // to create the parquet writer.
-        let (tx_execution_sender, tx_execution_receiver) = if config.shred_arrival_tracing_enabled {
-            let (tx, rx) = crossbeam_channel::bounded(100_000);
-            (Some(Arc::new(TxExecutionSender::new(tx))), Some(rx))
-        } else {
-            (None, None)
-        };
-
         match (
             &config.block_verification_method,
             &config.block_production_method,
@@ -1132,7 +1087,6 @@ impl Validator {
                     transaction_status_sender.clone(),
                     Some(replay_vote_sender.clone()),
                     prioritization_fee_cache.clone(),
-                    tx_execution_sender.clone(),
                 );
                 ensure_banking_stage_setup(
                     &scheduler_pool,
@@ -1475,7 +1429,6 @@ impl Validator {
         let (repair_response_quic_sender, repair_response_quic_receiver) = unbounded();
         let (ancestor_hashes_response_quic_sender, ancestor_hashes_response_quic_receiver) =
             unbounded();
-        let (_turbine_quic_endpoint_sender, turbine_quic_endpoint_receiver) = unbounded();
 
         let waited_for_supermajority = wait_for_supermajority(
             config,
@@ -1630,10 +1583,10 @@ impl Validator {
         // This channel backing up indicates a serious problem in votor
         let (votor_event_sender, votor_event_receiver) = bounded(1000);
 
-        let (xdp_retransmitter, xdp_sender) =
-            if let Some(xdp_retransmit_builder) = maybe_xdp_retransmit_builder {
-                let (rtx, sender) = xdp_retransmit_builder.build();
-                (Some(rtx), Some(sender))
+        let (xdp_transmitter, turbine_xdp_sender) =
+            if let Some((xdp_transmit_builder, src_addr)) = xdp_builder_with_src_addr {
+                let (rtx, sender) = xdp_transmit_builder.build();
+                (Some(rtx), Some(XdpSender::new(sender, src_addr)))
             } else {
                 (None, None)
             };
@@ -1645,19 +1598,6 @@ impl Validator {
             node.sockets.alpenglow
         } else {
             None
-        };
-
-        // Bind extra sockets for shredstream multi-heartbeat before TVU creation.
-        // These sockets become part of the TVU fetch pipeline so shreds arrive
-        // through ShredFetchStage with correct source IPs and native dedup.
-        let multi_hb_extra_ports = if config.shredstream_config.enabled {
-            let (extra_sockets, ports) = crate::shredstream::create_multi_heartbeat_sockets(
-                &config.shredstream_config.regions,
-            );
-            node.sockets.tvu.extend(extra_sockets);
-            ports
-        } else {
-            Vec::new()
         };
 
         let tvu = Tvu::new(
@@ -1706,11 +1646,7 @@ impl Validator {
                 replay_transactions_threads: config.replay_transactions_threads,
                 shred_sigverify_threads: config.tvu_shred_sigverify_threads,
                 bls_sigverify_threads: config.tvu_bls_sigverify_threads,
-                xdp_sender: xdp_sender.clone(),
-                shred_arrival_tracing_enabled: config.shred_arrival_tracing_enabled,
-                shred_arrival_output_dir: config.shred_arrival_output_dir.clone(),
-                tx_execution_sender: tx_execution_sender.clone(),
-                tx_execution_receiver,
+                turbine_xdp_sender: turbine_xdp_sender.clone(),
             },
             &max_slots,
             block_metadata_notifier,
@@ -1720,7 +1656,6 @@ impl Validator {
             prioritization_fee_cache.clone(),
             banking_tracer,
             repair_response_quic_receiver,
-            turbine_quic_endpoint_receiver,
             repair_quic_async_senders.repair_request_quic_sender,
             repair_quic_async_senders.ancestor_hashes_request_quic_sender,
             ancestor_hashes_response_quic_receiver,
@@ -1742,49 +1677,6 @@ impl Validator {
             },
         )
         .map_err(ValidatorError::Other)?;
-
-        let shredstream_service = if config.shredstream_config.enabled {
-            // Get the TVU address from node ContactInfo (UDP protocol for shreds)
-            let tvu_addr_opt = node
-                .info
-                .tvu(solana_client::connection_cache::Protocol::UDP);
-
-            let public_ip = config
-                .shredstream_config
-                .public_ip
-                .or_else(|| tvu_addr_opt.as_ref().map(|addr| addr.ip()))
-                .ok_or_else(|| {
-                    ValidatorError::Other(
-                        "Shredstream requires public IP: use --shredstream-public-ip or ensure TVU is configured".into()
-                    )
-                })?;
-
-            let tvu_port = tvu_addr_opt
-                .as_ref()
-                .map(|addr| addr.port())
-                .ok_or_else(|| {
-                    ValidatorError::Other("Shredstream requires TVU port to be configured".into())
-                })?;
-
-            let tvu_addr = SocketAddr::new(public_ip, tvu_port);
-            info!("Shredstream: registering TVU address {}", tvu_addr);
-
-            match crate::shredstream::ShredstreamService::new(
-                config.shredstream_config.clone(),
-                &identity_keypair,
-                tvu_addr,
-                multi_hb_extra_ports,
-                exit.clone(),
-            ) {
-                Ok(service) => Some(service),
-                Err(e) => {
-                    warn!("Failed to start shredstream service: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
 
         let tpu_forwaring_client_config = {
             let runtime_handle = tpu_client_next_runtime
@@ -1819,7 +1711,7 @@ impl Validator {
             entry_notification_sender,
             blockstore.clone(),
             &config.broadcast_stage_type,
-            xdp_sender,
+            turbine_xdp_sender,
             exit.clone(),
             node.info.shred_version(),
             vote_tracker,
@@ -1923,9 +1815,8 @@ impl Validator {
             repair_quic_endpoints,
             repair_quic_endpoints_runtime,
             repair_quic_endpoints_join_handle,
-            xdp_retransmitter,
+            xdp_transmitter,
             _tpu_client_next_runtime: tpu_client_next_runtime,
-            shredstream_service,
         })
     }
 
@@ -2097,8 +1988,8 @@ impl Validator {
         self.accounts_background_service
             .join()
             .expect("accounts_background_service");
-        if let Some(xdp_retransmitter) = self.xdp_retransmitter {
-            xdp_retransmitter.join().expect("xdp_retransmitter");
+        if let Some(xdp_transmitter) = self.xdp_transmitter {
+            xdp_transmitter.join().expect("xdp_transmitter");
         }
         self.tpu.join().expect("tpu");
         self.tvu.join().expect("tvu");
@@ -2113,10 +2004,6 @@ impl Validator {
 
         if let Some(geyser_plugin_service) = self.geyser_plugin_service {
             geyser_plugin_service.join().expect("geyser_plugin_service");
-        }
-
-        if let Some(shredstream_service) = self.shredstream_service {
-            shredstream_service.join().expect("shredstream_service");
         }
     }
 }
@@ -2314,7 +2201,7 @@ fn load_blockstore(
     *start_progress.write().unwrap() = ValidatorStartProgress::LoadingLedger;
 
     let mut process_options = blockstore_processor::ProcessOptions {
-        run_verification: false,
+        run_verification: config.run_verification,
         halt_at_slot: None,
         new_hard_forks: config.new_hard_forks.clone(),
         debug_keys: config.debug_keys.clone(),
@@ -2323,13 +2210,6 @@ fn load_blockstore(
         accounts_db_force_initial_clean: config.accounts_db_force_initial_clean,
         runtime_config: config.runtime_config.clone(),
         use_snapshot_archives_at_startup: config.use_snapshot_archives_at_startup,
-        // Performance optimizations for readonly/observer mode
-        no_block_cost_limits: true, // Skip cost tracking (u64::MAX limits)
-        verify_index: false,        // Skip accounts index verification
-        run_final_accounts_hash_calc: false, // Skip final hash calc (debugging only)
-        allow_dead_slots: true,     // Continue processing dead slots
-        full_leader_cache: true,    // Cache all leader schedules
-        abort_on_invalid_block: false, // Continue on invalid blocks
         ..blockstore_processor::ProcessOptions::default()
     };
 
@@ -2570,6 +2450,7 @@ impl<'a> ProcessBlockStore<'a> {
     }
 }
 
+// `--warp-slot`: runs at startup only (before PoH/replay), so fork graph access is serial here.
 fn maybe_warp_slot(
     config: &ValidatorConfig,
     process_blockstore: &mut ProcessBlockStore,
@@ -2579,20 +2460,20 @@ fn maybe_warp_slot(
     snapshot_controller: &SnapshotController,
 ) -> Result<(), String> {
     if let Some(warp_slot) = config.warp_slot {
-        let mut bank_forks = bank_forks.write().unwrap();
+        let root_bank = {
+            let bank_forks_r = bank_forks.read().unwrap();
+            let working_bank = bank_forks_r.working_bank();
+            if warp_slot <= working_bank.slot() {
+                return Err(format!(
+                    "warp slot ({}) cannot be less than the working bank slot ({})",
+                    warp_slot,
+                    working_bank.slot()
+                ));
+            }
+            bank_forks_r.root_bank()
+        };
 
-        let working_bank = bank_forks.working_bank();
-
-        if warp_slot <= working_bank.slot() {
-            return Err(format!(
-                "warp slot ({}) cannot be less than the working bank slot ({})",
-                warp_slot,
-                working_bank.slot()
-            ));
-        }
         info!("warping to slot {warp_slot}");
-
-        let root_bank = bank_forks.root_bank();
 
         // An accounts hash calculation from storages will occur in warp_from_parent() below.  This
         // requires that the accounts cache has been flushed, which requires the parent slot to be
@@ -2600,17 +2481,24 @@ fn maybe_warp_slot(
         root_bank.squash();
         root_bank.force_flush_accounts_cache();
 
-        bank_forks.insert(Bank::warp_from_parent(
-            root_bank,
-            &Pubkey::default(),
-            warp_slot,
-        ));
+        // Do not call `Bank::warp_from_parent` while holding `bank_forks.write()`: child bank
+        // construction runs `ProgramCache::extract`, which takes `fork_graph.read()` on this same
+        // `RwLock<BankForks>` (deadlock with an exclusive lock).
+        let warp_bank = Bank::warp_from_parent(root_bank, SlotLeader::default(), warp_slot);
+
+        let mut bank_forks = bank_forks.write().unwrap();
+        bank_forks.insert(warp_bank);
+        // The bank must have a block id set to take a snapshot.
+        // Also must be set before calling set_root() just incase the warp slot triggers a
+        // snapshot request based on the snapshot config inside snapshot_controller.
+        let warp_bank = bank_forks.get(warp_slot).unwrap();
+        Bank::calculate_and_set_block_id_for_dcou(&warp_bank);
         bank_forks.set_root(warp_slot, Some(snapshot_controller), Some(warp_slot));
-        leader_schedule_cache.set_root(&bank_forks.root_bank());
+        leader_schedule_cache.set_root(&warp_bank);
 
         let full_snapshot_archive_info = match snapshot_bank_utils::bank_to_full_snapshot_archive(
             ledger_path,
-            &bank_forks.root_bank(),
+            &warp_bank,
             None,
             &config.snapshot_config.full_snapshot_archives_dir,
             &config.snapshot_config.incremental_snapshot_archives_dir,
@@ -3064,6 +2952,7 @@ mod tests {
         solana_entry::entry,
         solana_genesis_config::create_genesis_config,
         solana_gossip::contact_info::ContactInfo,
+        solana_leader_schedule::SlotLeader,
         solana_ledger::{
             blockstore, create_new_tmp_ledger, genesis_utils::create_genesis_config_with_leader,
             get_tmp_ledger_path_auto_delete,
@@ -3401,7 +3290,7 @@ mod tests {
         // bank=1, wait=0, should pass, bank is past the wait slot
         let bank_forks = BankForks::new_rw_arc(Bank::new_from_parent(
             bank_forks.read().unwrap().root_bank(),
-            &Pubkey::default(),
+            SlotLeader::default(),
             1,
         ));
         config.wait_for_supermajority = Some(0);

@@ -17,14 +17,12 @@ use {
             layout::{get_shred, resign_packet},
             wire::is_retransmitter_signed_variant,
         },
-        shred_arrival_store::{ShredArrivalMeta, ShredArrivalSource},
         sigverify_shreds::{LruCache, SlotPubkeys, verify_shreds},
     },
-    solana_metrics::datapoint_info,
     solana_perf::{
         self,
         deduper::Deduper,
-        packet::{PacketBatch, PacketFlags, PacketRefMut},
+        packet::{PacketBatch, PacketRefMut},
     },
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
@@ -42,13 +40,6 @@ use {
     thiserror::Error,
 };
 
-#[inline(always)]
-fn monotonic_micros() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) };
-    (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1_000
-}
-
 // 34MB where each cache entry is 136 bytes.
 const SIGVERIFY_LRU_CACHE_CAPACITY: usize = 1 << 18;
 
@@ -65,7 +56,7 @@ const CLUSTER_NODES_CACHE_NUM_EPOCH_CAP: usize = 2;
 const CLUSTER_NODES_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Maximum number of packet batches to process in a single sigverify iteration.
-const SIGVERIFY_SHRED_BATCH_SIZE: usize = 1024 * 8;
+const SIGVERIFY_SHRED_BATCH_SIZE: usize = 1024;
 
 #[allow(clippy::enum_variant_names)]
 enum ShredSigverifyError {
@@ -82,22 +73,21 @@ enum ResignError {
     Shred(#[from] shred::Error),
 }
 
-/// Bit flag used to mark packets that arrived via QUIC (as opposed to UDP).
-/// Uses UNUSED_0 (0x10) from PacketFlags which is explicitly reserved for reuse.
-const QUIC_ORIGIN_FLAG: u8 = 0b0001_0000;
-
 pub fn spawn_shred_sigverify(
+    cluster_info: Arc<ClusterInfo>,
+    bank_forks: Arc<RwLock<BankForks>>,
+    leader_schedule_cache: Arc<LeaderScheduleCache>,
     shred_fetch_receiver: Receiver<PacketBatch>,
-    verified_sender: Sender<
-        Vec<(
-            shred::Payload,
-            /*is_repaired:*/ bool,
-            Option<ShredArrivalMeta>,
-        )>,
-    >,
+    retransmit_sender: EvictingSender<Vec<shred::Payload>>,
+    verified_sender: Sender<Vec<(shred::Payload, /*is_repaired:*/ bool)>>,
     num_sigverify_threads: NonZeroUsize,
 ) -> JoinHandle<()> {
     let mut stats = ShredSigVerifyStats::new(Instant::now());
+    let cache = RwLock::new(LruCache::new(SIGVERIFY_LRU_CACHE_CAPACITY));
+    let cluster_nodes_cache = ClusterNodesCache::<RetransmitStage>::new(
+        CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
+        CLUSTER_NODES_CACHE_TTL,
+    );
     let thread_pool = ThreadPoolBuilder::new()
         .num_threads(num_sigverify_threads.get())
         .thread_name(|i| format!("solSvrfyShred{i:02}"))
@@ -111,11 +101,21 @@ pub fn spawn_shred_sigverify(
             if deduper.maybe_reset(&mut rng, DEDUPER_FALSE_POSITIVE_RATE, DEDUPER_RESET_CYCLE) {
                 stats.num_deduper_saturations += 1;
             }
+            // We can't store the keypair outside the loop
+            // because the identity might be hot swapped.
+            let keypair = cluster_info.keypair();
             match run_shred_sigverify(
                 &thread_pool,
+                &keypair,
+                &cluster_info,
+                &bank_forks,
+                &leader_schedule_cache,
                 &deduper,
                 &shred_fetch_receiver,
+                &retransmit_sender,
                 &verified_sender,
+                &cluster_nodes_cache,
+                &cache,
                 &mut stats,
                 &mut shred_buffer,
             ) {
@@ -136,15 +136,16 @@ pub fn spawn_shred_sigverify(
 #[allow(clippy::too_many_arguments)]
 fn run_shred_sigverify<const K: usize>(
     thread_pool: &ThreadPool,
+    keypair: &Keypair,
+    cluster_info: &ClusterInfo,
+    bank_forks: &RwLock<BankForks>,
+    leader_schedule_cache: &LeaderScheduleCache,
     deduper: &Deduper<K, [u8]>,
     shred_fetch_receiver: &Receiver<PacketBatch>,
-    verified_sender: &Sender<
-        Vec<(
-            shred::Payload,
-            /*is_repaired:*/ bool,
-            Option<ShredArrivalMeta>,
-        )>,
-    >,
+    retransmit_sender: &EvictingSender<Vec<shred::Payload>>,
+    verified_sender: &Sender<Vec<(shred::Payload, /*is_repaired:*/ bool)>>,
+    cluster_nodes_cache: &ClusterNodesCache<RetransmitStage>,
+    cache: &RwLock<LruCache>,
     stats: &mut ShredSigVerifyStats,
     shred_buffer: &mut Vec<PacketBatch>,
 ) -> Result<(), ShredSigverifyError> {
@@ -177,8 +178,7 @@ fn run_shred_sigverify<const K: usize>(
     // path once a shred is repaired.
     // For backward compatibility we need to allow trailing bytes in the packet
     // after the shred payload, but have to exclude them here from the deduper.
-    let dedup_start = Instant::now();
-    let num_duplicates_this_batch = thread_pool.install(|| {
+    stats.num_duplicates += thread_pool.install(|| {
         shred_buffer
             .par_iter_mut()
             .flatten()
@@ -192,107 +192,84 @@ fn run_shred_sigverify<const K: usize>(
             .map(|mut packet| packet.meta_mut().set_discard(true))
             .count()
     });
-    let dedup_us = dedup_start.elapsed().as_micros() as u64;
-    stats.num_duplicates += num_duplicates_this_batch;
-    stats.dedup_micros += dedup_us;
-
+    let (working_bank, root_bank) = {
+        let bank_forks = bank_forks.read().unwrap();
+        (bank_forks.working_bank(), bank_forks.root_bank())
+    };
+    verify_packets(
+        thread_pool,
+        &keypair.pubkey(),
+        &working_bank,
+        leader_schedule_cache,
+        shred_buffer,
+        cache,
+    );
     stats.num_discards_post += count_discards(shred_buffer);
     // Verify retransmitter's signature, and resign shreds
     // Merkle root as the retransmitter node.
-    // NOTE: Retransmitter signature verification is currently disabled for latency optimization
-    // (see verify_retransmitter_signature function). If re-enabled, timing should be added here.
-
+    let resign_start = Instant::now();
+    thread_pool.install(|| {
+        shred_buffer
+            .par_iter_mut()
+            .flatten()
+            .filter(|packet| !packet.meta().discard())
+            .for_each(|mut packet| {
+                if maybe_verify_and_resign_packet(
+                    &mut packet,
+                    &root_bank,
+                    &working_bank,
+                    cluster_info,
+                    leader_schedule_cache,
+                    cluster_nodes_cache,
+                    stats,
+                    keypair,
+                )
+                .is_err()
+                {
+                    packet.meta_mut().set_discard(true);
+                }
+            })
+    });
+    stats.resign_micros += resign_start.elapsed().as_micros() as u64;
     // Extract shred payload from packets, and separate out repaired shreds.
-    // Also capture arrival metadata for optional tracing.
-    let payload_extract_start = Instant::now();
     let (shreds, repairs): (Vec<_>, Vec<_>) = shred_buffer
         .iter()
         .flat_map(|batch| batch.iter())
         .filter(|packet| !packet.meta().discard())
         .filter_map(|packet| {
             let shred = shred::layout::get_shred(packet)?.to_vec();
-            let meta = packet.meta();
-            let is_repair = meta.repair();
-            let is_quic = meta.flags.bits() & QUIC_ORIGIN_FLAG != 0;
-
-            // Capture arrival metadata
-            let total_us = monotonic_micros();
-            let arrival_meta = ShredArrivalMeta {
-                arrival_time_ms: total_us / 1000,
-                arrival_time_us: (total_us % 1000) as u32,
-                source_ip: meta.addr,
-                source: if is_repair {
-                    if is_quic {
-                        ShredArrivalSource::RepairQuic
-                    } else {
-                        ShredArrivalSource::RepairUdp
-                    }
-                } else if is_quic {
-                    ShredArrivalSource::TurbineQuic
-                } else {
-                    ShredArrivalSource::TurbineUdp
-                },
-            };
-
-            Some((shred, is_repair, arrival_meta))
+            Some((shred, packet.meta().repair()))
         })
-        .partition_map(|(shred, repair, arrival_meta)| {
+        .partition_map(|(shred, repair)| {
             if repair {
                 // No need for Arc overhead here because repaired shreds are
                 // not retranmitted.
-                Either::Right((shred::Payload::from(shred), arrival_meta))
+                Either::Right(shred::Payload::from(shred))
             } else {
                 // Share the payload between the retransmit-stage and the
                 // window-service.
-                Either::Left((shred::Payload::from(shred), arrival_meta))
+                Either::Left(shred::Payload::from(shred))
             }
         });
-    let payload_extract_us = payload_extract_start.elapsed().as_micros() as u64;
-    stats.payload_extract_micros += payload_extract_us;
-
     // Repaired shreds are not retransmitted.
-    let num_retransmit_shreds = shreds.len();
-    let num_shreds_to_window = num_retransmit_shreds + repairs.len();
-    stats.num_retransmit_shreds += num_retransmit_shreds;
-
-    // Short-circuit for empty batches: skip sending to channels when all shreds were duplicates
-    let (send_to_retransmit_us, send_to_window_us) = if num_shreds_to_window == 0 {
-        (0u64, 0u64)
-    } else {
-        let shreds = shreds
-            .into_iter()
-            .map(|(shred, meta)| (shred, /*is_repaired:*/ false, Some(meta)));
-        let repairs = repairs
-            .into_iter()
-            .map(|(shred, meta)| (shred, /*is_repaired:*/ true, Some(meta)));
-        let send_window_start = Instant::now();
-        verified_sender.send(shreds.chain(repairs).collect())?;
-        let send_to_window_us = send_window_start.elapsed().as_micros() as u64;
-        stats.send_to_window_micros += send_to_window_us;
-
-        (0, send_to_window_us)
-    };
-
-    let total_elapsed_us = now.elapsed().as_micros() as u64;
-    stats.elapsed_micros += total_elapsed_us;
-
-    // Emit per-batch timing datapoint (similar to confirm_slot_entries_timing)
-    let num_batches = shred_buffer.len();
-    if false {
-        datapoint_info!(
-            "shred_sigverify_timing",
-            ("num_batches", num_batches as i64, i64),
-            ("num_packets", stats.num_packets as i64, i64),
-            ("num_shreds", num_shreds_to_window as i64, i64),
-            ("num_duplicates", num_duplicates_this_batch as i64, i64),
-            ("dedup_us", dedup_us as i64, i64),
-            ("payload_extract_us", payload_extract_us as i64, i64),
-            ("send_to_retransmit_us", send_to_retransmit_us as i64, i64),
-            ("send_to_window_us", send_to_window_us as i64, i64),
-            ("total_us", total_elapsed_us as i64, i64),
-        );
+    stats.num_retransmit_shreds += shreds.len();
+    if let Err(send_err) = retransmit_sender.try_send(shreds.clone()) {
+        match send_err {
+            crossbeam_channel::TrySendError::Full(v) => {
+                stats.num_retransmit_stage_overflow_shreds += v.len();
+            }
+            _ => unreachable!("EvictingSender holds on to both ends of the channel"),
+        }
     }
-
+    // Send all shreds to window service to be inserted into blockstore.
+    let shreds = shreds
+        .into_iter()
+        .map(|shred| (shred, /*is_repaired:*/ false));
+    let repairs = repairs
+        .into_iter()
+        .map(|shred| (shred, /*is_repaired:*/ true));
+    verified_sender.send(shreds.chain(repairs).collect())?;
+    stats.elapsed_micros += now.elapsed().as_micros() as u64;
     shred_buffer.clear();
     Ok(())
 }
@@ -359,10 +336,6 @@ fn verify_retransmitter_signature(
     cluster_nodes_cache: &ClusterNodesCache<RetransmitStage>,
     stats: &ShredSigVerifyStats,
 ) -> bool {
-    // OPTIMIZATION: Skip retransmitter signature verification for lower latency
-    return true;
-
-    #[allow(unreachable_code)]
     let signature = match shred::layout::get_retransmitter_signature(shred) {
         Ok(signature) => signature,
         // If the shred is not of resigned variant,
@@ -498,11 +471,6 @@ struct ShredSigVerifyStats {
     num_unknown_turbine_parent: AtomicUsize,
     elapsed_micros: u64,
     resign_micros: u64,
-    // Hot path timing metrics
-    dedup_micros: u64,
-    payload_extract_micros: u64,
-    send_to_retransmit_micros: u64,
-    send_to_window_micros: u64,
 }
 
 impl ShredSigVerifyStats {
@@ -527,10 +495,6 @@ impl ShredSigVerifyStats {
             num_unknown_turbine_parent: AtomicUsize::default(),
             elapsed_micros: 0u64,
             resign_micros: 0u64,
-            dedup_micros: 0u64,
-            payload_extract_micros: 0u64,
-            send_to_retransmit_micros: 0u64,
-            send_to_window_micros: 0u64,
         }
     }
 
@@ -582,14 +546,6 @@ impl ShredSigVerifyStats {
             ),
             ("elapsed_micros", self.elapsed_micros, i64),
             ("resign_micros", self.resign_micros, i64),
-            ("dedup_micros", self.dedup_micros, i64),
-            ("payload_extract_micros", self.payload_extract_micros, i64),
-            (
-                "send_to_retransmit_micros",
-                self.send_to_retransmit_micros,
-                i64
-            ),
-            ("send_to_window_micros", self.send_to_window_micros, i64),
         );
         *self = Self::new(Instant::now());
     }

@@ -9,35 +9,27 @@ use {
             OutstandingShredRepairs, RepairInfo, RepairService, RepairServiceChannels,
         },
         result::{Error, Result},
-        slot_latency_tracker::{LatencyEvent, LatencyEventSender},
     },
     agave_feature_set as feature_set,
-    // ahash::AHashSet - unused after disabling early prefetch (data staleness fix)
-    crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender},
+    crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded},
     rayon::{ThreadPool, prelude::*},
-    solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
+    solana_clock::{DEFAULT_MS_PER_SLOT, Slot},
     solana_gossip::cluster_info::ClusterInfo,
     solana_ledger::{
         blockstore::{Blockstore, BlockstoreInsertionMetrics, PossibleDuplicateShred},
-        dataset_tracking::DatasetSignatureSender,
+        blockstore_meta::BlockLocation,
         leader_schedule_cache::LeaderScheduleCache,
         shred::{self, ReedSolomonCache, Shred},
-        shred_arrival_store::{ShredArrivalBuffer, ShredArrivalMeta},
-        shredder::Shredder,
-        window_service_tracer::{
-            WindowServiceEvent, WindowServiceEventSender, WindowServiceEventType,
-        },
     },
+    solana_measure::measure::Measure,
     solana_metrics::inc_new_counter_error,
-    // solana_pubkey::Pubkey - unused after disabling early prefetch (data staleness fix)
+    solana_rayon_threadlimit::get_thread_count,
     solana_runtime::bank_forks::BankForks,
     solana_streamer::evicting_sender::EvictingSender,
     solana_turbine::cluster_nodes,
     std::{
         borrow::Cow,
-        collections::{HashMap, HashSet},
         net::UdpSocket,
-        ops::Range,
         sync::{
             Arc, RwLock,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -62,16 +54,6 @@ struct WindowServiceMetrics {
     num_errors_cross_beam_recv_timeout: u64,
     num_errors_other: u64,
     num_errors_try_crossbeam_send: u64,
-    // Hot path timing metrics (time to replay)
-    shred_payload_build_us: u64,
-    blockstore_insert_elapsed_us: u64,
-    // Early prefetch metrics
-    early_prefetch_keys_extracted: u64,
-    early_prefetch_spawned: u64,
-    early_prefetch_keys_collect_us: u64,
-    early_prefetch_bank_slot: u64,     // Slot of bank used for prefetch
-    early_prefetch_slot_distance: u64, // Distance from root to prefetch bank
-    early_prefetch_disabled: u64,      // Count of times prefetch was skipped (data staleness fix)
 }
 
 impl WindowServiceMetrics {
@@ -104,36 +86,6 @@ impl WindowServiceMetrics {
                 self.num_errors_cross_beam_recv_timeout,
                 i64
             ),
-            // Hot path timing metrics
-            ("shred_payload_build_us", self.shred_payload_build_us, i64),
-            (
-                "blockstore_insert_elapsed_us",
-                self.blockstore_insert_elapsed_us,
-                i64
-            ),
-            // Early prefetch metrics
-            (
-                "early_prefetch_keys_extracted",
-                self.early_prefetch_keys_extracted,
-                i64
-            ),
-            ("early_prefetch_spawned", self.early_prefetch_spawned, i64),
-            (
-                "early_prefetch_keys_collect_us",
-                self.early_prefetch_keys_collect_us,
-                i64
-            ),
-            (
-                "early_prefetch_bank_slot",
-                self.early_prefetch_bank_slot,
-                i64
-            ),
-            (
-                "early_prefetch_slot_distance",
-                self.early_prefetch_slot_distance,
-                i64
-            ),
-            ("early_prefetch_disabled", self.early_prefetch_disabled, i64),
         );
     }
 
@@ -167,8 +119,8 @@ fn run_check_duplicate(
             root_bank = bank_forks.read().unwrap().root_bank();
         }
         let shred_slot = shred.slot();
-        let chained_merkle_conflict_duplicate_proofs = cluster_nodes::check_feature_activation(
-            &feature_set::chained_merkle_conflict_duplicate_proofs::id(),
+        let validate_chained_block_id = cluster_nodes::check_feature_activation(
+            &feature_set::validate_chained_block_id::id(),
             shred_slot,
             &root_bank,
         );
@@ -176,23 +128,13 @@ fn run_check_duplicate(
             PossibleDuplicateShred::LastIndexConflict(shred, conflict)
             | PossibleDuplicateShred::ErasureConflict(shred, conflict)
             | PossibleDuplicateShred::MerkleRootConflict(shred, conflict) => (shred, conflict),
-            PossibleDuplicateShred::ChainedMerkleRootConflict(shred, conflict) => {
-                if chained_merkle_conflict_duplicate_proofs {
-                    // Although this proof can be immediately stored on detection, we wait until
-                    // here in order to check the feature flag, as storage in blockstore can
-                    // preclude the detection of other duplicate proofs in this slot
-                    if blockstore.has_duplicate_shreds_in_slot(shred_slot) {
-                        return Ok(());
-                    }
-                    blockstore.store_duplicate_slot(
-                        shred_slot,
-                        conflict.clone(),
-                        shred.clone().into_payload(),
-                    )?;
-                    (shred, conflict)
-                } else {
-                    return Ok(());
+            PossibleDuplicateShred::ChainedMerkleRootConflict(_shred, _conflict) => {
+                if validate_chained_block_id {
+                    // Although chained merkle roots are not necessary for agave duplicate resolution protocols,
+                    // We still need to mark the block as dead for other client teams.
+                    blockstore.set_dead_slot(shred_slot)?;
                 }
+                return Ok(());
             }
             PossibleDuplicateShred::Exists(shred) => {
                 // Unlike the other cases we have to wait until here to decide to handle the duplicate and store
@@ -220,7 +162,7 @@ fn run_check_duplicate(
 
         Ok(())
     };
-    const RECV_TIMEOUT: Duration = Duration::from_millis(1);
+    const RECV_TIMEOUT: Duration = Duration::from_millis(200);
     std::iter::once(shred_receiver.recv_timeout(RECV_TIMEOUT)?)
         .chain(shred_receiver.try_iter())
         .try_for_each(check_duplicate)
@@ -228,255 +170,83 @@ fn run_check_duplicate(
 
 #[allow(clippy::too_many_arguments)]
 fn run_insert<F>(
-    verified_receiver: &Receiver<
-        Vec<(
-            shred::Payload,
-            /*is_repaired:*/ bool,
-            Option<ShredArrivalMeta>,
-        )>,
-    >,
+    thread_pool: &ThreadPool,
+    verified_receiver: &Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool)>>,
     blockstore: &Blockstore,
     leader_schedule_cache: &LeaderScheduleCache,
     handle_duplicate: F,
     metrics: &mut BlockstoreInsertionMetrics,
     ws_metrics: &mut WindowServiceMetrics,
     completed_data_sets_sender: Option<&CompletedDataSetsSender>,
+    retransmit_sender: &EvictingSender<Vec<shred::Payload>>,
     reed_solomon_cache: &ReedSolomonCache,
-    latency_event_sender: Option<&LatencyEventSender>,
-    _bank_forks: &RwLock<BankForks>, // Unused after disabling early prefetch (data staleness fix)
-    shred_arrival_buffer: Option<&ShredArrivalBuffer>,
-    dataset_signature_sender: Option<&DatasetSignatureSender>,
-    event_tracer: Option<&WindowServiceEventSender>,
 ) -> Result<()>
 where
     F: Fn(PossibleDuplicateShred),
 {
-    const RECV_TIMEOUT: Duration = Duration::from_millis(1);
-
-    // Get batch_id for event tracing
-    let batch_id = event_tracer.map(|t| t.next_batch_id()).unwrap_or(0);
-
-    // Record run_insert start
-    if let Some(tracer) = event_tracer {
-        tracer.record_simple(WindowServiceEventType::RunInsertStart, batch_id);
-        tracer.record_simple(WindowServiceEventType::RecvWaitStart, batch_id);
-    }
-
-    // Separate wait time from merge time for accurate measurement
-    let recv_wait_start = Instant::now();
+    const RECV_TIMEOUT: Duration = Duration::from_millis(200);
+    let mut shred_receiver_elapsed = Measure::start("shred_receiver_elapsed");
     let mut shreds = verified_receiver.recv_timeout(RECV_TIMEOUT)?;
-    let recv_wait_us = recv_wait_start.elapsed().as_micros() as u64;
-
-    if let Some(tracer) = event_tracer {
-        tracer.record_simple(WindowServiceEventType::RecvWaitEnd, batch_id);
-        tracer.record_simple(WindowServiceEventType::BatchMergeStart, batch_id);
-    }
-
-    for mut batch in verified_receiver.try_iter() {
-        shreds.append(&mut batch);
-    }
-
-    if let Some(tracer) = event_tracer {
-        tracer.record_simple(WindowServiceEventType::BatchMergeEnd, batch_id);
-        tracer.record_simple(WindowServiceEventType::HandlePacketsStart, batch_id);
-    }
-
-    let shred_receiver_elapsed_us = recv_wait_us;
-    ws_metrics.shred_receiver_elapsed_us += shred_receiver_elapsed_us;
+    shreds.extend(verified_receiver.try_iter().flatten());
+    shred_receiver_elapsed.stop();
+    ws_metrics.shred_receiver_elapsed_us += shred_receiver_elapsed.as_us();
     ws_metrics.run_insert_count += 1;
-
-
+    let handle_shred = |(shred, repair): (shred::Payload, bool)| {
+        if repair {
+            ws_metrics.num_repairs.fetch_add(1, Ordering::Relaxed);
+        }
+        let shred = Shred::new_from_serialized_shred(shred).ok()?;
+        Some((Cow::Owned(shred), repair, BlockLocation::Original))
+    };
     let now = Instant::now();
-    let shreds: Vec<_> = shreds
-        .into_iter()
-        .filter_map(|(shred_payload, repair, arrival_meta)| {
-            // Parse shred - keep shred_payload available for capture
-            let shred = Shred::new_from_serialized_shred(shred_payload.clone()).ok()?;
-
-            if let (Some(buffer), Some(meta)) = (shred_arrival_buffer, &arrival_meta) {
-                buffer.record_arrival(shred.slot(), shred.index(), shred.is_data(), meta.clone());
-            }
-
-            Some((Cow::<'_, Shred>::Owned(shred), repair))
-        })
-        .collect();
-
-    let handle_packets_elapsed_us = now.elapsed().as_micros() as u64;
-    ws_metrics.handle_packets_elapsed_us += handle_packets_elapsed_us;
-
-    let num_shreds_received = shreds.len();
-    ws_metrics.num_shreds_received += num_shreds_received;
-
-    if let Some(tracer) = event_tracer {
-        tracer.record(
-            WindowServiceEvent::new(WindowServiceEventType::HandlePacketsEnd, batch_id)
-                .with_num_shreds(num_shreds_received),
-        );
-    }
-
-    if shreds.is_empty() {
-        if let Some(tracer) = event_tracer {
-            tracer.record_simple(WindowServiceEventType::RunInsertEnd, batch_id);
-        }
-        let total_run_insert_us = shred_receiver_elapsed_us + handle_packets_elapsed_us;
-        if false {
-            datapoint_info!(
-                "window_service_timing",
-                ("num_shreds", 0i64, i64),
-                ("recv_wait_us", recv_wait_us as i64, i64),
-                ("handle_packets_us", handle_packets_elapsed_us as i64, i64),
-                ("shred_payload_build_us", 0i64, i64),
-                ("blockstore_insert_us", 0i64, i64),
-                ("total_us", total_run_insert_us as i64, i64),
-            );
-        }
-        return Ok(());
-    }
-
-    if let Some(tracer) = event_tracer {
-        tracer.record_simple(WindowServiceEventType::BlockstoreInsertStart, batch_id);
-    }
-
-    let blockstore_insert_start = Instant::now();
-    let metrics_snapshot_lock = metrics.insert_lock_elapsed_us;
-    let metrics_snapshot_insert = metrics.insert_shreds_elapsed_us;
-    let metrics_snapshot_recovery = metrics.shred_recovery_elapsed_us;
-    let metrics_snapshot_chaining = metrics.chaining_elapsed_us;
-    let metrics_snapshot_commit = metrics.commit_working_sets_elapsed_us;
-    let metrics_snapshot_recovered = metrics.num_recovered;
-    let metrics_snapshot_data = metrics.data_shred_elapsed_us;
-    let metrics_snapshot_code = metrics.code_shred_elapsed_us;
-    let metrics_snapshot_num_data = metrics.num_data_shreds;
-    let metrics_snapshot_num_code = metrics.num_code_shreds;
-    let metrics_snapshot_meta_lookup = metrics.meta_lookup_us;
-    let metrics_snapshot_cache_insert = metrics.cache_insert_us;
-    let metrics_snapshot_erasure_lookup = metrics.erasure_lookup_us;
-    // max fields are reset after each batch read (not cumulative)
-    metrics.max_data_shred_us = 0;
-    metrics.max_code_shred_us = 0;
-    let completed_data_sets = blockstore.insert_shreds_handle_duplicate(
+    let shreds: Vec<_> = thread_pool.install(|| {
+        shreds
+            .into_par_iter()
+            .with_min_len(32)
+            .filter_map(handle_shred)
+            .collect()
+    });
+    ws_metrics.handle_packets_elapsed_us += now.elapsed().as_micros() as u64;
+    ws_metrics.num_shreds_received += shreds.len();
+    let completed_data_sets = blockstore.insert_shreds_at_location_handle_duplicate(
         shreds,
         Some(leader_schedule_cache),
-        true,
+        false, // is_trusted
+        retransmit_sender,
         &handle_duplicate,
         reed_solomon_cache,
         metrics,
-        false,
     )?;
 
-    let blockstore_insert_elapsed_us = blockstore_insert_start.elapsed().as_micros() as u64;
-    ws_metrics.blockstore_insert_elapsed_us += blockstore_insert_elapsed_us;
-
-    if let Some(tracer) = event_tracer {
-        tracer.record(
-            WindowServiceEvent::new(WindowServiceEventType::BlockstoreInsertEnd, batch_id)
-                .with_completed_data_sets(completed_data_sets.len()),
-        );
-    }
-
-    // Drain completed data sets from arrival buffer to prevent unbounded growth
-    if let Some(buffer) = shred_arrival_buffer {
-        for completed in &completed_data_sets {
-            buffer.on_completed_data_set(completed.slot, completed.indices.clone());
-        }
-    }
-
-    // Emit per-batch timing datapoint (similar to confirm_slot_entries_timing)
-    let total_run_insert_us =
-        shred_receiver_elapsed_us + handle_packets_elapsed_us + blockstore_insert_elapsed_us;
-
-    if false { 
-    datapoint_info!(
-        "window_service_timing",
-        ("num_shreds", num_shreds_received as i64, i64),
-        ("recv_wait_us", recv_wait_us as i64, i64),
-        ("handle_packets_us", handle_packets_elapsed_us as i64, i64),
-        (
-            "blockstore_insert_us",
-            blockstore_insert_elapsed_us as i64,
-            i64
-        ),
-        ("insert_lock_us", (metrics.insert_lock_elapsed_us - metrics_snapshot_lock) as i64, i64),
-        ("insert_shreds_us", (metrics.insert_shreds_elapsed_us - metrics_snapshot_insert) as i64, i64),
-        ("recovery_us", (metrics.shred_recovery_elapsed_us - metrics_snapshot_recovery) as i64, i64),
-        ("chaining_us", (metrics.chaining_elapsed_us - metrics_snapshot_chaining) as i64, i64),
-        ("commit_us", (metrics.commit_working_sets_elapsed_us - metrics_snapshot_commit) as i64, i64),
-        ("num_recovered", (metrics.num_recovered - metrics_snapshot_recovered) as i64, i64),
-        ("data_shred_us", (metrics.data_shred_elapsed_us - metrics_snapshot_data) as i64, i64),
-        ("code_shred_us", (metrics.code_shred_elapsed_us - metrics_snapshot_code) as i64, i64),
-        ("max_data_shred_us", metrics.max_data_shred_us as i64, i64),
-        ("max_code_shred_us", metrics.max_code_shred_us as i64, i64),
-        ("num_data", (metrics.num_data_shreds - metrics_snapshot_num_data) as i64, i64),
-        ("num_code", (metrics.num_code_shreds - metrics_snapshot_num_code) as i64, i64),
-        ("meta_lookup_us", (metrics.meta_lookup_us - metrics_snapshot_meta_lookup) as i64, i64),
-        ("cache_insert_us", (metrics.cache_insert_us - metrics_snapshot_cache_insert) as i64, i64),
-        ("erasure_lookup_us", (metrics.erasure_lookup_us - metrics_snapshot_erasure_lookup) as i64, i64),
-        ("total_us", total_run_insert_us as i64, i64),
-        ("completed_data_sets", completed_data_sets.len() as i64, i64),
-    );
-    }
-
-    if let Some(tracer) = event_tracer {
-        tracer.record(
-            WindowServiceEvent::new(WindowServiceEventType::RunInsertEnd, batch_id)
-                .with_num_shreds(num_shreds_received)
-                .with_completed_data_sets(completed_data_sets.len()),
-        );
+    if let Some(sender) = completed_data_sets_sender {
+        sender.try_send(completed_data_sets)?;
     }
 
     Ok(())
 }
 
 pub struct WindowServiceChannels {
-    pub verified_receiver: Receiver<
-        Vec<(
-            shred::Payload,
-            /*is_repaired:*/ bool,
-            Option<ShredArrivalMeta>,
-        )>,
-    >,
+    pub verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool)>>,
+    pub retransmit_sender: EvictingSender<Vec<shred::Payload>>,
     pub completed_data_sets_sender: Option<CompletedDataSetsSender>,
     pub duplicate_slots_sender: DuplicateSlotSender,
     pub repair_service_channels: RepairServiceChannels,
-    /// Optional sender for latency tracking events
-    pub latency_event_sender: Option<LatencyEventSender>,
-    /// Optional buffer for shred arrival tracing.
-    /// When provided, arrival metadata is recorded and CSV files are written
-    /// when completed data sets are produced.
-    pub shred_arrival_buffer: Option<Arc<ShredArrivalBuffer>>,
-    /// Optional sender for dataset signature CSV tracking.
-    pub dataset_signature_sender: Option<Arc<DatasetSignatureSender>>,
-    /// Optional sender for window service event tracing.
-    /// When provided, timing events are recorded throughout the window service pipeline.
-    pub window_service_event_sender: Option<WindowServiceEventSender>,
 }
 
 impl WindowServiceChannels {
     pub fn new(
-        verified_receiver: Receiver<
-            Vec<(
-                shred::Payload,
-                /*is_repaired:*/ bool,
-                Option<ShredArrivalMeta>,
-            )>,
-        >,
+        verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool)>>,
+        retransmit_sender: EvictingSender<Vec<shred::Payload>>,
         completed_data_sets_sender: Option<CompletedDataSetsSender>,
         duplicate_slots_sender: DuplicateSlotSender,
         repair_service_channels: RepairServiceChannels,
-        latency_event_sender: Option<LatencyEventSender>,
-        shred_arrival_buffer: Option<Arc<ShredArrivalBuffer>>,
-        dataset_signature_sender: Option<Arc<DatasetSignatureSender>>,
-        window_service_event_sender: Option<WindowServiceEventSender>,
     ) -> Self {
         Self {
             verified_receiver,
+            retransmit_sender,
             completed_data_sets_sender,
             duplicate_slots_sender,
             repair_service_channels,
-            latency_event_sender,
-            shred_arrival_buffer,
-            dataset_signature_sender,
-            window_service_event_sender,
         }
     }
 }
@@ -503,13 +273,10 @@ impl WindowService {
 
         let WindowServiceChannels {
             verified_receiver,
+            retransmit_sender,
             completed_data_sets_sender,
             duplicate_slots_sender,
             repair_service_channels,
-            latency_event_sender,
-            shred_arrival_buffer,
-            dataset_signature_sender,
-            window_service_event_sender,
         } = window_service_channels;
 
         let repair_service = RepairService::new(
@@ -530,7 +297,7 @@ impl WindowService {
             blockstore.clone(),
             duplicate_receiver,
             duplicate_slots_sender,
-            bank_forks.clone(),
+            bank_forks,
         );
 
         let t_insert = Self::start_window_insert_thread(
@@ -540,11 +307,7 @@ impl WindowService {
             verified_receiver,
             duplicate_sender,
             completed_data_sets_sender,
-            latency_event_sender,
-            bank_forks,
-            shred_arrival_buffer,
-            dataset_signature_sender,
-            window_service_event_sender,
+            retransmit_sender,
         );
 
         WindowService {
@@ -589,20 +352,10 @@ impl WindowService {
         exit: Arc<AtomicBool>,
         blockstore: Arc<Blockstore>,
         leader_schedule_cache: Arc<LeaderScheduleCache>,
-        verified_receiver: Receiver<
-            Vec<(
-                shred::Payload,
-                /*is_repaired:*/ bool,
-                Option<ShredArrivalMeta>,
-            )>,
-        >,
+        verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool)>>,
         check_duplicate_sender: Sender<PossibleDuplicateShred>,
         completed_data_sets_sender: Option<CompletedDataSetsSender>,
-        latency_event_sender: Option<LatencyEventSender>,
-        bank_forks: Arc<RwLock<BankForks>>,
-        shred_arrival_buffer: Option<Arc<ShredArrivalBuffer>>,
-        dataset_signature_sender: Option<Arc<DatasetSignatureSender>>,
-        window_service_event_sender: Option<WindowServiceEventSender>,
+        retransmit_sender: EvictingSender<Vec<shred::Payload>>,
     ) -> JoinHandle<()> {
         let handle_error = || {
             inc_new_counter_error!("solana-window-insert-error", 1, 1);
@@ -611,6 +364,15 @@ impl WindowService {
         Builder::new()
             .name("solWinInsert".to_string())
             .spawn(move || {
+                let thread_pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(get_thread_count().min(8))
+                    // Use the current thread as one of the workers. This reduces overhead when the
+                    // pool is used to process a small number of shreds, since they'll be processed
+                    // directly on the current thread.
+                    .use_current_thread()
+                    .thread_name(|i| format!("solWinInsert{i:02}"))
+                    .build()
+                    .unwrap();
                 let handle_duplicate = |possible_duplicate_shred| {
                     let _ = check_duplicate_sender.send(possible_duplicate_shred);
                 };
@@ -619,6 +381,7 @@ impl WindowService {
                 let mut last_print = Instant::now();
                 while !exit.load(Ordering::Relaxed) {
                     if let Err(e) = run_insert(
+                        &thread_pool,
                         &verified_receiver,
                         &blockstore,
                         &leader_schedule_cache,
@@ -626,12 +389,8 @@ impl WindowService {
                         &mut metrics,
                         &mut ws_metrics,
                         completed_data_sets_sender.as_ref(),
+                        &retransmit_sender,
                         &reed_solomon_cache,
-                        latency_event_sender.as_ref(),
-                        &bank_forks,
-                        shred_arrival_buffer.as_deref(),
-                        dataset_signature_sender.as_deref(),
-                        window_service_event_sender.as_ref(),
                     ) {
                         ws_metrics.record_error(&e);
                         if Self::should_exit_on_error(e, &handle_error) {
@@ -814,6 +573,7 @@ mod test {
             let _ = duplicate_shred_sender.send(shred);
         };
         let num_trials = 100;
+        let (dummy_retransmit_sender, _) = EvictingSender::new_bounded(0);
         for slot in 0..num_trials {
             let (shreds, _) = make_many_slot_entries(slot, 1, 10);
             let duplicate_index = 0;
@@ -832,10 +592,10 @@ mod test {
                     shreds,
                     None,
                     false, // is_trusted
+                    &dummy_retransmit_sender,
                     &handle_duplicate,
                     &ReedSolomonCache::default(),
                     &mut BlockstoreInsertionMetrics::default(),
-                    false, // skip_signal
                 )
                 .unwrap();
 
