@@ -54,8 +54,9 @@ use {
         filter::{Memcmp, RpcFilterType},
         request::{
             DELINQUENT_VALIDATOR_SLOT_DISTANCE, MAX_GET_CONFIRMED_BLOCKS_RANGE,
-            MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT, MAX_GET_PROGRAM_ACCOUNT_FILTERS,
-            MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS, MAX_GET_SLOT_LEADERS, MAX_MULTIPLE_ACCOUNTS,
+            MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT, MAX_GET_LAST_ACCOUNT_ACTIVITY,
+            MAX_GET_PROGRAM_ACCOUNT_FILTERS, MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS,
+            MAX_GET_SLOT_LEADERS, MAX_MULTIPLE_ACCOUNTS,
             MAX_RPC_VOTE_ACCOUNT_INFO_EPOCH_CREDITS_HISTORY, NUM_LARGEST_ACCOUNTS,
             TokenAccountsFilter,
         },
@@ -579,6 +580,22 @@ impl JsonRpcRequestProcessor {
             );
         }
         Ok(new_response(&bank, accounts))
+    }
+
+    pub fn get_last_account_activity(
+        &self,
+        pubkeys: Vec<Pubkey>,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<RpcResponse<Vec<Option<Slot>>>> {
+        let bank = self.bank(commitment);
+        let results: Vec<Option<Slot>> = pubkeys
+            .iter()
+            .map(|pubkey| {
+                bank.get_account_modified_slot(pubkey)
+                    .map(|(_, slot)| slot)
+            })
+            .collect();
+        Ok(new_response(&bank, results))
     }
 
     pub fn get_minimum_balance_for_rent_exemption(
@@ -3621,6 +3638,14 @@ pub mod rpc_full {
             meta: Self::Metadata,
             pubkey_strs: Option<Vec<String>>,
         ) -> Result<Vec<RpcPrioritizationFee>>;
+
+        #[rpc(meta, name = "getLastAccountActivity")]
+        fn get_last_account_activity(
+            &self,
+            meta: Self::Metadata,
+            pubkey_strs: Vec<String>,
+            commitment: Option<CommitmentConfig>,
+        ) -> Result<RpcResponse<Vec<Option<Slot>>>>;
     }
 
     pub struct FullImpl;
@@ -4329,6 +4354,28 @@ pub mod rpc_full {
                 .map(|pubkey_str| verify_pubkey(&pubkey_str))
                 .collect::<Result<Vec<_>>>()?;
             meta.get_recent_prioritization_fees(pubkeys)
+        }
+
+        fn get_last_account_activity(
+            &self,
+            meta: Self::Metadata,
+            pubkey_strs: Vec<String>,
+            commitment: Option<CommitmentConfig>,
+        ) -> Result<RpcResponse<Vec<Option<Slot>>>> {
+            debug!(
+                "get_last_account_activity rpc request received: {} pubkeys",
+                pubkey_strs.len()
+            );
+            if pubkey_strs.len() > MAX_GET_LAST_ACCOUNT_ACTIVITY {
+                return Err(Error::invalid_params(format!(
+                    "Too many inputs provided; max {MAX_GET_LAST_ACCOUNT_ACTIVITY}"
+                )));
+            }
+            let pubkeys = pubkey_strs
+                .into_iter()
+                .map(|pubkey_str| verify_pubkey(&pubkey_str))
+                .collect::<Result<Vec<_>>>()?;
+            meta.get_last_account_activity(pubkeys, commitment)
         }
     }
 }
@@ -9476,5 +9523,61 @@ pub mod tests {
                 },
             ],
         );
+    }
+
+    #[test]
+    fn test_rpc_get_last_account_activity() {
+        let rpc = RpcHandler::start();
+        let bank = rpc.working_bank();
+
+        let pubkey = Pubkey::new_unique();
+        let non_existent = Pubkey::new_unique();
+
+        // Store an account so it has a modified slot
+        bank.store_account(
+            &pubkey,
+            &AccountSharedData::new(42, 0, &solana_pubkey::Pubkey::default()),
+        );
+
+        // Test: mix of existing and non-existent accounts
+        let request = create_test_request(
+            "getLastAccountActivity",
+            Some(json!([[
+                pubkey.to_string(),
+                non_existent.to_string(),
+            ]])),
+        );
+        let response: RpcResponse<Vec<Option<u64>>> =
+            parse_success_result(rpc.handle_request_sync(request));
+        assert_eq!(response.value.len(), 2);
+        assert!(
+            response.value[0].is_some(),
+            "stored account should have activity"
+        );
+        assert!(
+            response.value[1].is_none(),
+            "non-existent account should be None"
+        );
+
+        // Test: empty input
+        let request = create_test_request(
+            "getLastAccountActivity",
+            Some(json!([Vec::<String>::new()])),
+        );
+        let response: RpcResponse<Vec<Option<u64>>> =
+            parse_success_result(rpc.handle_request_sync(request));
+        assert!(response.value.is_empty());
+
+        // Test: batch limit exceeded
+        let too_many: Vec<String> = (0..10_001)
+            .map(|_| Pubkey::new_unique().to_string())
+            .collect();
+        let request = create_test_request("getLastAccountActivity", Some(json!([too_many])));
+        let response = rpc.handle_request_sync(request);
+        if let Response::Single(Output::Failure(failure)) = response {
+            assert!(failure.error.message.contains("Too many inputs"));
+        } else {
+            panic!("Expected failure for batch limit exceeded");
+        }
     }
 }
