@@ -2537,7 +2537,7 @@ impl ReplayStage {
             &process_active_banks_context.replay_tx_thread_pool,
             &mut w_replay_stats,
             &mut w_replay_progress,
-            false,
+            true, // skip_verification: skip PoH and sigverify for read-only validator
             process_active_banks_context
                 .transaction_status_sender
                 .as_ref(),
