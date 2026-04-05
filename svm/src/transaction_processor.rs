@@ -12,10 +12,14 @@ use {
         nonce_info::NonceInfo,
         program_loader::{get_program_deployment_slot, load_program_with_pubkey},
         rollback_accounts::RollbackAccounts,
-        transaction_account_state_info::TransactionAccountStateInfo,
+        transaction_account_state_info::{
+            TransactionAccountStateInfo, get_uninitialized_accounts_size,
+        },
         transaction_balances::BalanceCollector,
         transaction_error_metrics::TransactionErrorMetrics,
-        transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails},
+        transaction_execution_result::{
+            AccountsDeltas, ExecutedTransaction, TransactionExecutionDetails,
+        },
         transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
     },
     log::debug,
@@ -40,10 +44,10 @@ use {
         },
         invoke_context::{EnvironmentConfig, InvokeContext},
         loaded_programs::{
-            EpochBoundaryPreparation, ForkGraph, ProgramCache, ProgramCacheEntry,
-            ProgramCacheForTxBatch, ProgramCacheMatchCriteria, ProgramRuntimeEnvironment,
-            ProgramRuntimeEnvironments,
+            EpochBoundaryPreparation, ForkGraph, ProgramCache, ProgramCacheForTxBatch,
+            ProgramCacheMatchCriteria, ProgramRuntimeEnvironment, ProgramRuntimeEnvironments,
         },
+        program_cache_entry::ProgramCacheEntry,
         solana_sbpf::{program::BuiltinProgram, vm::Config as VmConfig},
         sysvar_cache::SysvarCache,
     },
@@ -1043,8 +1047,8 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
 
         execute_timings.execute_accessories.process_message_us += process_message_time.as_us();
 
-        let mut status = process_result
-            .and_then(|info| {
+        let mut post_account_state_info_result = process_result
+            .and_then(|_| {
                 let post_account_state_info =
                     TransactionAccountStateInfo::new(&transaction_context, tx, &environment.rent);
                 TransactionAccountStateInfo::verify_changes(
@@ -1052,7 +1056,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                     &post_account_state_info,
                     &transaction_context,
                 )
-                .map(|_| info)
+                .map(|_| post_account_state_info)
             })
             .map_err(|err| {
                 match err {
@@ -1086,17 +1090,32 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             accounts,
             return_data,
             touched_account_count,
-            accounts_resize_delta: accounts_data_len_delta,
+            accounts_resize_delta,
         } = execution_record;
 
-        if status.is_ok()
+        if post_account_state_info_result.is_ok()
             && transaction_accounts_lamports_sum(&accounts)
                 .filter(|lamports_after_tx| lamports_before_tx == *lamports_after_tx)
                 .is_none()
         {
-            status = Err(TransactionError::UnbalancedTransaction);
+            post_account_state_info_result = Err(TransactionError::UnbalancedTransaction);
         }
-        let status = status.map(|_| ());
+
+        // accounts_resize_delta and accounts_uninitialized_size must be set to None
+        // in the result if status is an error
+        let (status, accounts_deltas) = post_account_state_info_result
+            .map(|post_state_info| {
+                (
+                    Ok(()),
+                    Some(AccountsDeltas {
+                        accounts_resize_delta,
+                        accounts_uninitialized_size: get_uninitialized_accounts_size(
+                            &post_state_info,
+                        ),
+                    }),
+                )
+            })
+            .unwrap_or_else(|err| (Err(err), None));
 
         loaded_transaction.accounts = accounts;
         execute_timings.details.total_account_count += loaded_transaction.accounts.len() as u64;
@@ -1117,7 +1136,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 inner_instructions,
                 return_data,
                 executed_units,
-                accounts_data_len_delta,
+                accounts_deltas,
             },
             loaded_transaction,
             programs_modified_by_tx: program_cache_for_tx_batch.drain_modified_entries(),
@@ -1153,7 +1172,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 vec![Vec::new(); top_level_ixs_num];
             for (cpi_num, ((ix_in_trace, ix_data), ix_accounts)) in ix_trace
                 .into_iter()
-                .zip(ix_data_trace.into_iter())
+                .zip(ix_data_trace)
                 .zip(accounts)
                 .skip(top_level_ixs_num)
                 .enumerate()
@@ -1290,11 +1309,12 @@ mod tests {
                 SVMTransactionExecutionAndFeeBudgetLimits, SVMTransactionExecutionBudget,
             },
             invoke_context::BuiltinFunctionRegisterer,
-            loaded_programs::{BlockRelation, ProgramCacheEntryType},
+            loaded_programs::BlockRelation,
+            program_cache_entry::ProgramCacheEntryType,
         },
         solana_rent::Rent,
         solana_sbpf::vm,
-        solana_sdk_ids::{bpf_loader, loader_v4, system_program, sysvar},
+        solana_sdk_ids::{bpf_loader, bpf_loader_upgradeable, system_program, sysvar},
         solana_signature::Signature,
         solana_svm_callback::{AccountState, InvokeContextCallback},
         solana_system_interface::instruction as system_instruction,
@@ -1807,7 +1827,7 @@ mod tests {
         let key1 = Pubkey::new_unique();
         let owner1 = bpf_loader::id();
         let key2 = Pubkey::new_unique();
-        let owner2 = loader_v4::id();
+        let owner2 = bpf_loader_upgradeable::id();
 
         let mut data1 = AccountSharedData::default();
         data1.set_owner(owner1);
@@ -1867,7 +1887,7 @@ mod tests {
         let non_program_pubkey1 = Pubkey::new_unique();
         let non_program_pubkey2 = Pubkey::new_unique();
         let program1_pubkey = bpf_loader::id();
-        let program2_pubkey = loader_v4::id();
+        let program2_pubkey = bpf_loader_upgradeable::id();
         let account1_pubkey = Pubkey::new_unique();
         let account2_pubkey = Pubkey::new_unique();
         let account3_pubkey = Pubkey::new_unique();

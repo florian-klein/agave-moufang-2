@@ -1,6 +1,6 @@
 #[cfg(feature = "dev-context-only-utils")]
 use {
-    crate::loaded_programs::ProgramCacheEntry,
+    crate::program_cache_entry::ProgramCacheEntry,
     solana_account::{AccountSharedData, WritableAccount, create_account_shared_data_for_test},
     solana_epoch_schedule::EpochSchedule,
     solana_instruction::AccountMeta,
@@ -13,9 +13,9 @@ use {
     crate::{
         execution_budget::{SVMTransactionExecutionBudget, SVMTransactionExecutionCost},
         loaded_programs::{
-            ProgramCacheEntryType, ProgramCacheForTxBatch, ProgramRuntimeEnvironment,
-            ProgramRuntimeEnvironments,
+            ProgramCacheForTxBatch, ProgramRuntimeEnvironment, ProgramRuntimeEnvironments,
         },
+        program_cache_entry::ProgramCacheEntryType,
         stable_log,
         sysvar_cache::SysvarCache,
     },
@@ -49,6 +49,7 @@ use {
         borrow::Cow,
         cell::RefCell,
         fmt::{self, Debug},
+        ptr,
         rc::Rc,
         sync::OnceLock,
         time::Duration,
@@ -127,6 +128,13 @@ impl ContextObject for InvokeContext<'_, '_> {
     fn get_remaining(&self) -> u64 {
         *self.compute_meter.borrow()
     }
+
+    fn active_mapping_ptr(&mut self) -> ptr::NonNull<MemoryMapping> {
+        let last_context = self
+            .get_memory_context_mut()
+            .expect("The memory context must have been set for the current instruction");
+        ptr::NonNull::from_mut(&mut last_context.memory_mapping)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -196,9 +204,38 @@ impl<'a> EnvironmentConfig<'a> {
     }
 }
 
-pub struct SyscallContext {
+/// This structure contains metadata about the memory for each instruction under execution.
+/// The BpfAllocator, accounts addresses in the guest and the memory mapping.
+pub struct MemoryContext {
     pub allocator: BpfAllocator,
     pub accounts_metadata: Vec<SerializedAccountMetadata>,
+    memory_mapping: Box<MemoryMapping>,
+}
+
+impl MemoryContext {
+    /// Creates a new memory context
+    pub fn new(
+        allocator: BpfAllocator,
+        accounts_metadata: Vec<SerializedAccountMetadata>,
+        memory_mapping: MemoryMapping,
+    ) -> Self {
+        Self {
+            allocator,
+            accounts_metadata,
+            memory_mapping: Box::new(memory_mapping),
+        }
+    }
+
+    /// Returns an empty dummy context used for builtin functions
+    pub(crate) fn empty() -> Self {
+        Self {
+            allocator: BpfAllocator::new(0),
+            accounts_metadata: Vec::new(),
+            memory_mapping: Box::new(
+                MemoryMapping::new(Vec::new(), &Config::default(), SBPFVersion::Reserved).unwrap(),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -229,7 +266,7 @@ pub struct InvokeContext<'a, 'ix_data> {
     /// Time spent so far executing nested program calls.
     pub total_nested_exec_time: Duration,
     pub timings: ExecuteDetailsTimings,
-    pub syscall_context: Vec<Option<SyscallContext>>,
+    pub memory_context: Vec<MemoryContext>,
     /// Pairs of index in TX instruction trace and VM register trace
     register_traces: Vec<(usize, Vec<[u64; 12]>)>,
     /// Debug port to use for this executing transaction.
@@ -256,7 +293,7 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             compute_meter: RefCell::new(compute_budget.compute_unit_limit),
             total_nested_exec_time: Duration::ZERO,
             timings: ExecuteDetailsTimings::default(),
-            syscall_context: Vec::new(),
+            memory_context: Vec::new(),
             register_traces: Vec::new(),
             #[cfg(feature = "sbpf-debugger")]
             debug_port: None,
@@ -290,13 +327,13 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             }
         }
 
-        self.syscall_context.push(None);
+        self.memory_context.push(MemoryContext::empty());
         self.transaction_context.push()
     }
 
     /// Pop a stack frame from the invocation stack
     pub(crate) fn pop(&mut self) -> Result<(), InstructionError> {
-        self.syscall_context.pop();
+        self.memory_context.pop();
         self.transaction_context.pop()
     }
 
@@ -638,20 +675,13 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
         let logger = self.get_log_collector();
         stable_log::program_invoke(&logger, &program_id, self.get_stack_height());
         let pre_remaining_units = self.get_remaining();
-        // Use a cached lightweight loader for builtins to avoid per-call allocation
-        // of Config, MemoryMapping, and call frames (builtins don't need them).
-        // The loader has enable_address_translation=false, so EbpfVm::new replaces
-        // whatever MemoryMapping we pass with Identity. We still need a valid one to
-        // pass in, so we create a minimal one from the cached loader's own config.
+        // Use a cached lightweight loader for builtins to avoid per-call allocation.
         let loader = builtin_vm_loader();
-        let empty_memory_mapping =
-            MemoryMapping::new(Vec::new(), loader.get_config(), SBPFVersion::V0).unwrap();
         let mut vm = EbpfVm::new(
             loader,
             SBPFVersion::V0,
             // Removes lifetime tracking
             unsafe { std::mem::transmute::<&mut InvokeContext, &mut InvokeContext>(self) },
-            empty_memory_mapping,
             0,
         );
         vm.invoke_function(function);
@@ -787,31 +817,29 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             .unwrap_or(true)
     }
 
-    // Set this instruction syscall context
-    pub fn set_syscall_context(
+    // Set this instruction memory context
+    pub fn set_memory_context(
         &mut self,
-        syscall_context: SyscallContext,
+        memory_context: MemoryContext,
     ) -> Result<(), InstructionError> {
         *self
-            .syscall_context
+            .memory_context
             .last_mut()
-            .ok_or(InstructionError::CallDepth)? = Some(syscall_context);
+            .ok_or(InstructionError::CallDepth)? = memory_context;
         Ok(())
     }
 
-    // Get this instruction's SyscallContext
-    pub fn get_syscall_context(&self) -> Result<&SyscallContext, InstructionError> {
-        self.syscall_context
+    // Get this instruction's MemoryContext
+    pub fn get_memory_context(&self) -> Result<&MemoryContext, InstructionError> {
+        self.memory_context
             .last()
-            .and_then(std::option::Option::as_ref)
             .ok_or(InstructionError::CallDepth)
     }
 
-    // Get this instruction's SyscallContext
-    pub fn get_syscall_context_mut(&mut self) -> Result<&mut SyscallContext, InstructionError> {
-        self.syscall_context
+    // Get this instruction's MemoryContext
+    pub fn get_memory_context_mut(&mut self) -> Result<&mut MemoryContext, InstructionError> {
+        self.memory_context
             .last_mut()
-            .and_then(|syscall_context| syscall_context.as_mut())
             .ok_or(InstructionError::CallDepth)
     }
 

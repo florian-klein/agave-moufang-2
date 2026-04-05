@@ -239,112 +239,6 @@ fn test_generate_index_for_single_ref_zero_lamport_slot() {
     );
 }
 
-fn generate_sample_account_from_storage(i: u8) -> AccountFromStorage {
-    // offset has to be 8 byte aligned
-    let offset = (i as usize) * std::mem::size_of::<u64>();
-    AccountFromStorage {
-        index_info: AccountInfo::new(StorageLocation::AppendVec(i as u32, offset), i == 0),
-        data_len: i as u64,
-        pubkey: Pubkey::new_from_array([i; 32]),
-    }
-}
-
-/// Reserve ancient storage size is not supported for TiredStorage
-#[test]
-fn test_sort_and_remove_dups() {
-    // empty
-    let mut test1 = vec![];
-    let expected = test1.clone();
-    AccountsDb::sort_and_remove_dups(&mut test1);
-    assert_eq!(test1, expected);
-    assert_eq!(test1, expected);
-    // just 0
-    let mut test1 = vec![generate_sample_account_from_storage(0)];
-    let expected = test1.clone();
-    AccountsDb::sort_and_remove_dups(&mut test1);
-    assert_eq!(test1, expected);
-    assert_eq!(test1, expected);
-    // 0, 1
-    let mut test1 = vec![
-        generate_sample_account_from_storage(0),
-        generate_sample_account_from_storage(1),
-    ];
-    let expected = test1.clone();
-    AccountsDb::sort_and_remove_dups(&mut test1);
-    assert_eq!(test1, expected);
-    assert_eq!(test1, expected);
-    // 1, 0. sort should reverse
-    let mut test2 = vec![
-        generate_sample_account_from_storage(1),
-        generate_sample_account_from_storage(0),
-    ];
-    AccountsDb::sort_and_remove_dups(&mut test2);
-    assert_eq!(test2, expected);
-    assert_eq!(test2, expected);
-
-    for insert_other_good in 0..2 {
-        // 0 twice so it gets removed
-        let mut test1 = vec![
-            generate_sample_account_from_storage(0),
-            generate_sample_account_from_storage(0),
-        ];
-        let mut expected = test1.clone();
-        expected.truncate(1); // get rid of 1st duplicate
-        test1.first_mut().unwrap().data_len = 2342342; // this one should be ignored, so modify the data_len so it will fail the compare below if it is used
-        if insert_other_good < 2 {
-            // insert another good one before or after the 2 bad ones
-            test1.insert(insert_other_good, generate_sample_account_from_storage(1));
-            // other good one should always be last since it is sorted after
-            expected.push(generate_sample_account_from_storage(1));
-        }
-        AccountsDb::sort_and_remove_dups(&mut test1);
-        assert_eq!(test1, expected);
-        assert_eq!(test1, expected);
-    }
-
-    let mut test1 = [1, 0, 1, 0, 1u8]
-        .into_iter()
-        .map(generate_sample_account_from_storage)
-        .collect::<Vec<_>>();
-    test1.iter_mut().take(3).for_each(|entry| {
-        entry.data_len = 2342342; // this one should be ignored, so modify the data_len so it will fail the compare below if it is used
-        entry.index_info = AccountInfo::new(StorageLocation::Cached, false);
-    });
-
-    let expected = [0, 1u8]
-        .into_iter()
-        .map(generate_sample_account_from_storage)
-        .collect::<Vec<_>>();
-    AccountsDb::sort_and_remove_dups(&mut test1);
-    assert_eq!(test1, expected);
-    assert_eq!(test1, expected);
-}
-
-#[test]
-fn test_sort_and_remove_dups_random() {
-    use rand::prelude::*;
-    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1234);
-    let accounts: Vec<_> =
-        std::iter::repeat_with(|| generate_sample_account_from_storage(rng.random::<u8>()))
-            .take(1000)
-            .collect();
-
-    let mut accounts1 = accounts.clone();
-    let num_dups1 = AccountsDb::sort_and_remove_dups(&mut accounts1);
-
-    // Use BTreeMap to calculate sort and remove dups alternatively.
-    let mut map = std::collections::BTreeMap::default();
-    let mut num_dups2 = 0;
-    for account in accounts.iter() {
-        if map.insert(*account.pubkey(), *account).is_some() {
-            num_dups2 += 1;
-        }
-    }
-    let accounts2: Vec<_> = map.into_values().collect();
-    assert_eq!(accounts1, accounts2);
-    assert_eq!(num_dups1, num_dups2);
-}
-
 pub(crate) fn append_single_account_with_default_hash(
     storage: &AccountStorageEntry,
     pubkey: &Pubkey,
@@ -1464,13 +1358,12 @@ fn test_clean_old_with_both_normal_and_zero_lamport_accounts() {
     let index_key = IndexKey::SplTokenMint(mint_key);
     let bank_id = 0;
     accounts
-        .accounts_index
         .index_scan_accounts(
             &Ancestors::default(),
             bank_id,
             index_key,
-            |key, _| {
-                found_accounts.insert(*key);
+            |account| {
+                found_accounts.insert(*account.unwrap().0);
             },
             &ScanConfig::default(),
         )
@@ -1542,12 +1435,13 @@ fn test_clean_old_with_both_normal_and_zero_lamport_accounts() {
     // Secondary index should have purged `pubkey1` as well
     let mut found_accounts = vec![];
     accounts
-        .accounts_index
         .index_scan_accounts(
             &Ancestors::default(),
             bank_id,
             IndexKey::SplTokenMint(mint_key),
-            |key, _| found_accounts.push(*key),
+            |account| {
+                found_accounts.push(*account.unwrap().0);
+            },
             &ScanConfig::default(),
         )
         .unwrap();
@@ -2509,7 +2403,8 @@ fn test_select_candidates_by_total_usage_all_clean(storage_access: StorageAccess
 #[test]
 fn test_delete_dependencies() {
     agave_logger::setup();
-    let accounts_index = AccountsIndex::<AccountInfo, AccountInfo>::default_for_tests();
+    let accounts = AccountsDb::new_single_for_tests();
+    let accounts_index = &accounts.accounts_index;
     let key0 = Pubkey::new_from_array([0u8; 32]);
     let key1 = Pubkey::new_from_array([1u8; 32]);
     let key2 = Pubkey::new_from_array([2u8; 32]);
@@ -2625,7 +2520,6 @@ fn test_delete_dependencies() {
     store_counts.insert(1, (0, HashSet::from_iter(vec![key0, key1])));
     store_counts.insert(2, (0, HashSet::from_iter(vec![key1, key2])));
     store_counts.insert(3, (1, HashSet::from_iter(vec![key2])));
-    let accounts = AccountsDb::new_single_for_tests();
     accounts.calc_delete_dependencies(&candidates, &mut store_counts, None);
     let mut stores: Vec<_> = store_counts.keys().cloned().collect();
     stores.sort_unstable();
@@ -3333,7 +3227,7 @@ fn test_scan_flush_accounts_cache_then_clean_drop() {
 
     // Check that the scan is properly set up
     assert_eq!(
-        db.accounts_index.min_ongoing_scan_root().unwrap(),
+        db.scan_tracker.min_ongoing_scan_root().unwrap(),
         max_scan_root
     );
 
@@ -3564,7 +3458,7 @@ fn setup_accounts_db_cache_clean(
                 scan_stall_key,
             ));
             assert_eq!(
-                accounts_db.accounts_index.min_ongoing_scan_root().unwrap(),
+                accounts_db.scan_tracker.min_ongoing_scan_root().unwrap(),
                 *slot
             );
         }
