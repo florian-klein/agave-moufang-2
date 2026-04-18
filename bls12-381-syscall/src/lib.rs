@@ -8,7 +8,7 @@
 //! # Supported Operations
 //!
 //! - **Group Operations** (G1 & G2): Addition, Subtraction, Scalar Multiplication.
-//! - **Pairing**: Multi-scalar multiplication (Miller loop + Final Exponentiation).
+//! - **Pairing**: Product of pairings over G1/G2 point pairs (multi-Miller loop + final exponentiation).
 //! - **Validation**: Subgroup and on-curve checks.
 //! - **Decompression**: Converting compressed byte representations to affine points.
 //!
@@ -24,7 +24,7 @@
 //! [ietf]: https://www.ietf.org/archive/id/draft-irtf-cfrg-pairing-friendly-curves-11.html#name-bls-curves-for-the-128-bit-
 
 pub use crate::{
-    addition::{bls12_381_g1_addition, bls12_381_g2_addition},
+    addition::{bls12_381_g1_addition_unchecked, bls12_381_g2_addition_unchecked},
     decompression::{bls12_381_g1_decompress, bls12_381_g2_decompress},
     encoding::{
         Endianness, PodG1Compressed, PodG1Point, PodG2Compressed, PodG2Point, PodGtElement,
@@ -32,7 +32,7 @@ pub use crate::{
     },
     multiplication::{bls12_381_g1_multiplication, bls12_381_g2_multiplication},
     pairing::bls12_381_pairing_map,
-    subtraction::{bls12_381_g1_subtraction, bls12_381_g2_subtraction},
+    subtraction::{bls12_381_g1_subtraction_unchecked, bls12_381_g2_subtraction_unchecked},
     validation::{bls12_381_g1_point_validation, bls12_381_g2_point_validation},
 };
 

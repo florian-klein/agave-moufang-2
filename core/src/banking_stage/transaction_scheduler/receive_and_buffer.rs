@@ -24,14 +24,14 @@ use {
     solana_address_lookup_table_interface::state::estimate_last_valid_slot,
     solana_clock::{Epoch, Slot},
     solana_cost_model::cost_model::CostModel,
-    solana_fee_structure::FeeBudgetLimits,
     solana_message::v0::LoadedAddresses,
     solana_runtime::{
         bank::Bank,
         bank_forks::{BankPair, SharableBanks},
     },
     solana_runtime_transaction::{
-        runtime_transaction::RuntimeTransaction, transaction_meta::StaticMeta,
+        runtime_transaction::RuntimeTransaction,
+        transaction_meta::{TransactionConfiguration, TransactionMeta},
         transaction_with_meta::TransactionWithMeta,
     },
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
@@ -415,16 +415,15 @@ impl TransactionViewReceiveAndBuffer {
             enable_instruction_accounts_limit,
         )?;
 
-        let Ok(compute_budget_limits) = view
-            .compute_budget_instruction_details()
-            .sanitize_and_convert_to_compute_budget_limits(&working_bank.feature_set)
+        let Ok(transaction_configuration) =
+            view.transaction_configuration(&working_bank.feature_set)
         else {
             return Err(PacketHandlingError::ComputeBudget);
         };
 
         let max_age = calculate_max_age(root_bank.epoch(), deactivation_slot, root_bank.slot());
-        let fee_budget_limits = FeeBudgetLimits::from(compute_budget_limits);
-        let (priority, cost) = calculate_priority_and_cost(&view, &fee_budget_limits, working_bank);
+        let (priority, cost) =
+            calculate_priority_and_cost(&view, &transaction_configuration, working_bank);
 
         Ok(TransactionState::new(view, max_age, priority, cost))
     }
@@ -488,7 +487,7 @@ pub(crate) fn load_addresses_for_view<D: TransactionData>(
     bank: &Bank,
 ) -> Result<(Option<LoadedAddresses>, Slot), PacketHandlingError> {
     match view.version() {
-        TransactionVersion::Legacy => Ok((None, u64::MAX)),
+        TransactionVersion::Legacy | TransactionVersion::V1 => Ok((None, u64::MAX)),
         TransactionVersion::V0 => bank
             .load_addresses_from_ref(view.address_table_lookup_iter())
             .map(|(loaded_addresses, deactivation_slot)| {
@@ -518,11 +517,11 @@ pub(crate) fn load_addresses_for_view<D: TransactionData>(
 /// the current transaction costs.
 pub(crate) fn calculate_priority_and_cost(
     transaction: &impl TransactionWithMeta,
-    fee_budget_limits: &FeeBudgetLimits,
+    transaction_configuration: &TransactionConfiguration,
     bank: &Bank,
 ) -> (u64, u64) {
     let cost = CostModel::calculate_cost(transaction, &bank.feature_set).sum();
-    let reward = bank.calculate_reward_for_transaction(transaction, fee_budget_limits);
+    let reward = bank.calculate_reward_for_transaction(transaction, transaction_configuration);
 
     // We need a multiplier here to avoid rounding down too aggressively.
     // For many transactions, the cost will be greater than the fees in terms of raw lamports.

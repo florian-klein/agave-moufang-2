@@ -147,7 +147,7 @@ impl BLSSigVerifier {
                     .current_epoch_stakes()
                     .bls_pubkey_to_rank_map()
                     .get_pubkey_stake_entry(vote.rank as usize)?;
-                Some((vote, entry.pubkey))
+                Some((vote, entry.node_pubkey))
             })
             .collect()
     }

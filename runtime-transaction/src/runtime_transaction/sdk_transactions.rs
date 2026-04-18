@@ -2,7 +2,7 @@ use {
     super::{ComputeBudgetInstructionDetails, RuntimeTransaction},
     crate::{
         instruction_meta::InstructionMeta,
-        transaction_meta::{StaticMeta, TransactionMeta},
+        transaction_meta::{CachedTransactionMeta, TransactionMeta},
         transaction_with_meta::TransactionWithMeta,
     },
     solana_message::{AddressLoader, TransactionSignatureDetails},
@@ -60,7 +60,7 @@ impl RuntimeTransaction<SanitizedVersionedTransaction> {
 
         Ok(Self {
             transaction: sanitized_versioned_tx,
-            meta: TransactionMeta {
+            meta: CachedTransactionMeta {
                 message_hash,
                 is_simple_vote_transaction: is_simple_vote_tx,
                 signature_details,
@@ -139,68 +139,6 @@ impl RuntimeTransaction<SanitizedTransaction> {
     fn load_dynamic_metadata(&mut self) -> Result<()> {
         Ok(())
     }
-
-    /// Create a new `RuntimeTransaction<SanitizedTransaction>` with minimal processing.
-    /// Skips compute budget extraction.
-    /// NOTE: Message hash is still computed as it's required for deduplication.
-    /// NOTE: Precompile signature counting is still done as it's required for bank hash.
-    /// NOTE: Vote detection is still done as it affects cost tracking and scheduling.
-    pub fn try_create_simple(
-        tx: VersionedTransaction,
-        address_loader: impl AddressLoader,
-        reserved_account_keys: &HashSet<Pubkey>,
-    ) -> Result<Self> {
-        let sanitized_versioned_tx = SanitizedVersionedTransaction::try_from(tx)?;
-
-        // Message hash is required for deduplication - cannot skip this
-        let message_hash = sanitized_versioned_tx.get_message().message.hash();
-
-        // Vote detection is required for proper cost tracking and scheduling
-        let is_simple_vote_tx = is_simple_vote_transaction(&sanitized_versioned_tx);
-
-        // Must count precompile signatures - this affects bank hash computation!
-        let InstructionMeta {
-            precompile_signature_details,
-            instruction_data_len,
-        } = InstructionMeta::try_new(
-            sanitized_versioned_tx
-                .get_message()
-                .program_instructions_iter()
-                .map(|(program_id, ix)| (program_id, SVMInstruction::from(ix))),
-        )?;
-
-        let signature_details = TransactionSignatureDetails::new(
-            u64::from(
-                sanitized_versioned_tx
-                    .get_message()
-                    .message
-                    .header()
-                    .num_required_signatures,
-            ),
-            precompile_signature_details.num_secp256k1_instruction_signatures,
-            precompile_signature_details.num_ed25519_instruction_signatures,
-            precompile_signature_details.num_secp256r1_instruction_signatures,
-        );
-
-        let sanitized_transaction = SanitizedTransaction::try_new(
-            sanitized_versioned_tx,
-            message_hash,
-            is_simple_vote_tx,
-            address_loader,
-            reserved_account_keys,
-        )?;
-
-        Ok(Self {
-            transaction: sanitized_transaction,
-            meta: TransactionMeta {
-                message_hash,
-                is_simple_vote_transaction: is_simple_vote_tx,
-                signature_details,
-                compute_budget_instruction_details: ComputeBudgetInstructionDetails::default(),
-                instruction_data_len,
-            },
-        })
-    }
 }
 
 impl TransactionWithMeta for RuntimeTransaction<SanitizedTransaction> {
@@ -212,6 +150,11 @@ impl TransactionWithMeta for RuntimeTransaction<SanitizedTransaction> {
     #[inline]
     fn to_versioned_transaction(&self) -> VersionedTransaction {
         self.transaction.to_versioned_transaction()
+    }
+
+    fn serialized_size(&self) -> usize {
+        wincode::serialized_size(&self.to_versioned_transaction())
+            .expect("versioned transaction serialization should succeed") as usize
     }
 }
 
@@ -414,17 +357,48 @@ mod tests {
         assert_eq!(0, signature_details.num_ed25519_instruction_signatures());
 
         for feature_set in [FeatureSet::default(), FeatureSet::all_enabled()] {
-            let compute_budget_limits = runtime_transaction_static
-                .compute_budget_instruction_details()
-                .sanitize_and_convert_to_compute_budget_limits(&feature_set)
+            let transaction_configuration = runtime_transaction_static
+                .transaction_configuration(&feature_set)
                 .unwrap();
-            assert_eq!(compute_unit_limit, compute_budget_limits.compute_unit_limit);
-            assert_eq!(compute_unit_price, compute_budget_limits.compute_unit_price);
+            assert_eq!(
+                compute_unit_limit,
+                transaction_configuration.compute_unit_limit
+            );
+            assert_eq!(
+                compute_unit_price,
+                transaction_configuration.compute_unit_price_in_microlamports()
+            );
             assert_eq!(
                 loaded_accounts_bytes,
-                compute_budget_limits.loaded_accounts_bytes.get()
+                transaction_configuration
+                    .loaded_accounts_data_size_limit
+                    .get()
             );
         }
+    }
+
+    #[test]
+    fn test_serialized_size() {
+        let transaction = RuntimeTransaction::<SanitizedTransaction>::try_from(
+            RuntimeTransaction::<SanitizedVersionedTransaction>::try_from(
+                non_vote_sanitized_versioned_transaction(),
+                MessageHash::Compute,
+                None,
+            )
+            .unwrap(),
+            SimpleAddressLoader::Disabled,
+            &ReservedAccountKeys::empty_key_set(),
+        )
+        .unwrap();
+
+        let expected = wincode::serialized_size(&transaction.to_versioned_transaction()).unwrap();
+        assert_eq!(transaction.serialized_size(), expected as usize);
+        assert_eq!(
+            expected,
+            wincode::serialize(&transaction.to_versioned_transaction())
+                .unwrap()
+                .len() as u64
+        );
     }
 
     #[test]
