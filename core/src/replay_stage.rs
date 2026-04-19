@@ -2560,7 +2560,7 @@ impl ReplayStage {
             &process_active_banks_context.replay_tx_thread_pool,
             &mut w_replay_stats,
             &mut w_replay_progress,
-            true, // skip_verification: skip PoH and sigverify for read-only validator
+            solana_ledger::TRUSTED_REPLAY.load(std::sync::atomic::Ordering::Relaxed), // skip PoH and sigverify
             process_active_banks_context
                 .transaction_status_sender
                 .as_ref(),

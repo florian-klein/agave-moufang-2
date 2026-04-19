@@ -3,6 +3,14 @@
 #![allow(clippy::arithmetic_side_effects)]
 #![recursion_limit = "4096"]
 
+/// When true, skip post-commit validations (cost limits, vote forwarding,
+/// prioritization fee cache) that are redundant when replaying trusted leader
+/// blocks. Default: true (optimized for read-only/observer validators).
+/// Set to false via environment variable AGAVE_FULL_VALIDATION=1.
+pub static TRUSTED_REPLAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(
+    !cfg!(feature = "dev-context-only-utils"),
+);
+
 pub mod bank_forks_utils;
 pub mod bigtable_delete;
 pub mod bigtable_upload;

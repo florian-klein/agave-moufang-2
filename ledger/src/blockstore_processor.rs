@@ -258,46 +258,51 @@ pub fn execute_batch<'a>(
             pre_commit_callback,
         )?;
 
-    let mut check_block_costs_elapsed = Measure::start("check_block_costs");
-    let tx_costs = if block_verification {
-        // Block verification (including unified scheduler) case;
-        // collect and check transaction costs
-        let tx_costs = get_transaction_costs(bank, &commit_results, batch.sanitized_transactions());
-        check_block_cost_limits(bank, &tx_costs).map(|_| tx_costs)
-    } else if record_transaction_meta {
-        // Unified scheduler block production case;
-        // the scheduler will track costs elsewhere but costs are recalculated
-        // here so they can be recorded with other transaction metadata
-        Ok(get_transaction_costs(
-            bank,
-            &commit_results,
-            batch.sanitized_transactions(),
-        ))
+    let tx_costs = if crate::TRUSTED_REPLAY.load(std::sync::atomic::Ordering::Relaxed) {
+        // TRUSTED REPLAY: Skip block cost limit checks, cost computation,
+        // prioritization fee cache update, and vote forwarding.
+        // These are post-commit — transactions are already committed.
+        // The leader enforced cost limits; re-checking is redundant.
+        vec![]
     } else {
-        // Unified scheduler block production without metadata recording
-        Ok(vec![])
+        let mut check_block_costs_elapsed = Measure::start("check_block_costs");
+        let tx_costs = if block_verification {
+            let tx_costs = get_transaction_costs(bank, &commit_results, batch.sanitized_transactions());
+            check_block_cost_limits(bank, &tx_costs).map(|_| tx_costs)
+        } else if record_transaction_meta {
+            Ok(get_transaction_costs(
+                bank,
+                &commit_results,
+                batch.sanitized_transactions(),
+            ))
+        } else {
+            Ok(vec![])
+        };
+        check_block_costs_elapsed.stop();
+        timings.saturating_add_in_place(
+            ExecuteTimingType::CheckBlockLimitsUs,
+            check_block_costs_elapsed.as_us(),
+        );
+        let tx_costs = tx_costs?;
+
+        bank_utils::find_and_send_votes(
+            batch.sanitized_transactions(),
+            &commit_results,
+            replay_vote_sender,
+            replay_vote_send_type,
+        );
+
+        if let Some(prioritization_fee_cache) = prioritization_fee_cache {
+            let committed_transactions = commit_results
+                .iter()
+                .zip(batch.sanitized_transactions())
+                .filter_map(|(commit_result, tx)| commit_result.was_committed().then_some(tx));
+            prioritization_fee_cache.update(bank, committed_transactions);
+        }
+
+        tx_costs
     };
-    check_block_costs_elapsed.stop();
-    timings.saturating_add_in_place(
-        ExecuteTimingType::CheckBlockLimitsUs,
-        check_block_costs_elapsed.as_us(),
-    );
-    let tx_costs = tx_costs?;
 
-    bank_utils::find_and_send_votes(
-        batch.sanitized_transactions(),
-        &commit_results,
-        replay_vote_sender,
-        replay_vote_send_type,
-    );
-
-    if let Some(prioritization_fee_cache) = prioritization_fee_cache {
-        let committed_transactions = commit_results
-            .iter()
-            .zip(batch.sanitized_transactions())
-            .filter_map(|(commit_result, tx)| commit_result.was_committed().then_some(tx));
-        prioritization_fee_cache.update(bank, committed_transactions);
-    }
     if let Some(transaction_status_sender) = transaction_status_sender {
         let transactions: Vec<SanitizedTransaction> = batch
             .sanitized_transactions()

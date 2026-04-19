@@ -102,6 +102,15 @@ pub fn execute(
         unsafe { env::set_var("RUST_BACKTRACE", "1") }
     }
 
+    // TRUSTED_REPLAY: set to false via AGAVE_FULL_VALIDATION=1 to enable
+    // all post-commit checks (cost limits, vote forwarding, PoH/sigverify).
+    if env::var("AGAVE_FULL_VALIDATION").is_ok() {
+        solana_ledger::TRUSTED_REPLAY.store(false, std::sync::atomic::Ordering::Relaxed);
+        info!("Full validation mode enabled (AGAVE_FULL_VALIDATION set)");
+    } else {
+        info!("Trusted replay mode enabled (skip post-commit validation)");
+    }
+
     let run_args = RunArgs::from_clap_arg_match(matches)?;
 
     let cli::thread_args::NumThreadConfig {
