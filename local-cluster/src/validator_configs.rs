@@ -83,6 +83,7 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         repair_handler_type: config.repair_handler_type.clone(),
         shredstream_config: config.shredstream_config.clone(),
         snapshot_packager_niceness_adj: config.snapshot_packager_niceness_adj,
+        shred_arrival_tracing_dir: config.shred_arrival_tracing_dir.clone(),
     }
 }
 

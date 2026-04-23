@@ -916,6 +916,13 @@ pub fn execute(
             "snapshot_packager_niceness_adj",
             i8
         ),
+        shred_arrival_tracing_dir: if matches.is_present("enable_shred_arrival_tracing") {
+            matches
+                .value_of("shred_arrival_output_dir")
+                .map(std::path::PathBuf::from)
+        } else {
+            None
+        },
     };
 
     let vote_account = pubkey_of(matches, "vote_account").unwrap_or_else(|| {
