@@ -7,10 +7,7 @@ use {
     solana_epoch_schedule::EpochSchedule,
     solana_gossip::cluster_info::ClusterInfo,
     solana_keypair::Keypair,
-    solana_ledger::{
-        fetch_stage_tracer::{FetchStageArrival, FetchStageArrivalSender},
-        shred::{self, layout as wire, ShredFetchStats, should_discard_shred},
-    },
+    solana_ledger::shred::{self, ShredFetchStats, should_discard_shred},
     solana_perf::packet::{PacketBatch, PacketBatchRecycler, PacketFlags, PacketRef},
     solana_pubkey::Pubkey,
     solana_runtime::{
@@ -102,7 +99,6 @@ impl ShredFetchStage {
         flags: PacketFlags,
         repair_context: Option<&RepairContext>,
         turbine_disabled: Arc<AtomicBool>,
-        fetch_stage_tracer: Option<FetchStageArrivalSender>,
     ) {
         // Only repair shreds need repair context.
         debug_assert_eq!(
@@ -114,34 +110,6 @@ impl ShredFetchStage {
         let mut stats = ShredFetchStats::default();
 
         for mut packet_batch in recvr {
-            // Capture arrival timestamp for tracing (before any processing)
-            if let Some(ref tracer) = fetch_stage_tracer {
-                let is_repair = flags.contains(PacketFlags::REPAIR);
-                for packet in packet_batch.iter() {
-                    if packet.meta().discard() {
-                        continue;
-                    }
-                    let meta = packet.meta();
-                    let (slot, shred_index) = packet
-                        .data(..)
-                        .and_then(|data| {
-                            let slot = wire::get_slot(data);
-                            let index = wire::get_index(data);
-                            Some((slot, index))
-                        })
-                        .unwrap_or((None, None));
-                    tracer.record(FetchStageArrival::new(
-                        slot,
-                        shred_index,
-                        None,
-                        meta.addr,
-                        meta.port,
-                        meta.size,
-                        is_repair,
-                        false,
-                    ));
-                }
-            }
             shred_filter_ctx.maybe_update(sharable_banks.root(), repair_context);
             stats.shred_count += packet_batch.len();
 
@@ -236,7 +204,6 @@ impl ShredFetchStage {
         flags: PacketFlags,
         repair_context: Option<RepairContext>,
         turbine_disabled: Arc<AtomicBool>,
-        fetch_stage_tracer: Option<FetchStageArrivalSender>,
     ) -> (Vec<JoinHandle<()>>, JoinHandle<()>) {
         let sharable_banks = bank_forks.read().unwrap().sharable_banks();
         let (packet_sender, packet_receiver) =
@@ -272,7 +239,6 @@ impl ShredFetchStage {
                     flags,
                     repair_context.as_ref(),
                     turbine_disabled,
-                    fetch_stage_tracer,
                 )
             })
             .unwrap();
@@ -290,7 +256,6 @@ impl ShredFetchStage {
         outstanding_repair_requests: Arc<RwLock<OutstandingShredRepairs>>,
         turbine_disabled: Arc<AtomicBool>,
         exit: Arc<AtomicBool>,
-        fetch_stage_tracer: Option<FetchStageArrivalSender>,
     ) -> Self {
         let recycler = PacketBatchRecycler::warmed(100, 1024);
         let repair_context = RepairContext {
@@ -313,7 +278,6 @@ impl ShredFetchStage {
             PacketFlags::empty(),
             None, // repair_context
             turbine_disabled.clone(),
-            fetch_stage_tracer.clone(),
         );
 
         let (repair_receiver, repair_handler) = Self::packet_modifier(
@@ -330,7 +294,6 @@ impl ShredFetchStage {
             PacketFlags::REPAIR,
             Some(repair_context.clone()),
             turbine_disabled.clone(),
-            fetch_stage_tracer,
         );
 
         tvu_threads.extend(repair_receiver);

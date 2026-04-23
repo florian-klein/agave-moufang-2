@@ -140,7 +140,6 @@ pub struct TvuConfig {
     pub shred_sigverify_threads: NonZeroUsize,
     pub bls_sigverify_threads: NonZeroUsize,
     pub turbine_xdp_sender: Option<XdpSender>,
-    pub fetch_stage_tracer: Option<solana_ledger::fetch_stage_tracer::FetchStageArrivalSender>,
 }
 
 impl Default for TvuConfig {
@@ -156,7 +155,6 @@ impl Default for TvuConfig {
             shred_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             bls_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             turbine_xdp_sender: None,
-            fetch_stage_tracer: None,
         }
     }
 }
@@ -350,7 +348,6 @@ impl Tvu {
             outstanding_repair_requests.clone(),
             turbine_disabled,
             exit.clone(),
-            tvu_config.fetch_stage_tracer,
         );
 
         let (verified_sender, verified_receiver) = unbounded();

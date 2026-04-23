@@ -381,8 +381,6 @@ pub struct ValidatorConfig {
     pub repair_handler_type: RepairHandlerType,
     // Thread niceness adjustment for snapshot packager service
     pub snapshot_packager_niceness_adj: i8,
-    /// Directory for shred arrival parquet files. None disables tracing.
-    pub shred_arrival_tracing_dir: Option<std::path::PathBuf>,
 }
 
 impl ValidatorConfig {
@@ -464,7 +462,6 @@ impl ValidatorConfig {
             voting_service_test_override: None,
             repair_handler_type: RepairHandlerType::default(),
             snapshot_packager_niceness_adj: 0,
-            shred_arrival_tracing_dir: None,
         }
     }
 
@@ -1606,11 +1603,6 @@ impl Validator {
                 shred_sigverify_threads: config.tvu_shred_sigverify_threads,
                 bls_sigverify_threads: config.tvu_bls_sigverify_threads,
                 turbine_xdp_sender: turbine_xdp_sender.clone(),
-                fetch_stage_tracer: config.shred_arrival_tracing_dir.as_ref().map(|dir| {
-                    let (sender, _writer) =
-                        solana_ledger::fetch_stage_tracer::create_fetch_stage_tracer(dir.clone());
-                    sender
-                }),
             },
             &max_slots,
             block_metadata_notifier,
