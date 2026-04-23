@@ -1607,10 +1607,8 @@ impl Validator {
                 bls_sigverify_threads: config.tvu_bls_sigverify_threads,
                 turbine_xdp_sender: turbine_xdp_sender.clone(),
                 fetch_stage_tracer: config.shred_arrival_tracing_dir.as_ref().map(|dir| {
-                    let (sender, writer) =
+                    let (sender, _writer) =
                         solana_ledger::fetch_stage_tracer::create_fetch_stage_tracer(dir.clone());
-                    // Keep the writer alive for the validator's lifetime
-                    std::mem::forget(writer);
                     sender
                 }),
             },
