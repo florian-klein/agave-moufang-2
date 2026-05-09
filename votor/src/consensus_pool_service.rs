@@ -61,6 +61,7 @@ pub(crate) struct ConsensusPoolContext {
     pub(crate) event_sender: VotorEventSender,
     pub(crate) commitment_sender: Sender<CommitmentAggregationData>,
 
+    /// Used to communicate the highest finalization cert the pool has observed to the block creation loop.
     pub(crate) highest_finalized: Arc<RwLock<Option<ValidatedBlockFinalizationCert>>>,
 }
 
@@ -112,12 +113,11 @@ impl ConsensusPoolService {
         certificates_to_send: Vec<Arc<Certificate>>,
         stats: &mut ConsensusPoolServiceStats,
     ) -> Result<(), AddVoteError> {
-        for (i, certificate) in certificates_to_send.iter().enumerate() {
+        let num_certs = certificates_to_send.len();
+        for (i, certificate) in certificates_to_send.into_iter().enumerate() {
             // The buffer should normally be large enough, so we don't handle
             // certificate re-send here.
-            match bls_sender.try_send(BLSOp::PushCertificate {
-                certificate: certificate.clone(),
-            }) {
+            match bls_sender.try_send(BLSOp::PushCertificate { certificate }) {
                 Ok(_) => {
                     stats.certificates_sent += 1;
                 }
@@ -127,7 +127,7 @@ impl ConsensusPoolService {
                     ));
                 }
                 Err(TrySendError::Full(_)) => {
-                    stats.certificates_dropped += certificates_to_send.len().saturating_sub(i);
+                    stats.certificates_dropped += num_certs.saturating_sub(i);
                     return Err(AddVoteError::VotingServiceQueueFull);
                 }
             }
@@ -384,8 +384,10 @@ impl ConsensusPoolService {
             .slot_leader_at(*highest_parent_ready, Some(&root_bank))
         else {
             error!(
-                "Unable to compute the leader at slot {highest_parent_ready}. Something is wrong, \
-                 exiting"
+                "my_pubkey={}: unable to compute leader: \
+                 highest_parent_ready={highest_parent_ready} root_bank_slot={}.  Exiting",
+                ctx.cluster_info.id(),
+                root_bank.slot()
             );
             ctx.exit.store(true, Ordering::Relaxed);
             return;
@@ -452,7 +454,8 @@ mod tests {
             vote::Vote,
         },
         solana_bls_signatures::{
-            keypair::Keypair as BLSKeypair, signature::Signature as BLSSignature,
+            BLS_SIGNATURE_AFFINE_SIZE, keypair::Keypair as BLSKeypair,
+            signature::Signature as BLSSignature,
         },
         solana_gossip::cluster_info::ClusterInfo,
         solana_hash::Hash,
@@ -651,7 +654,7 @@ mod tests {
         let target_slot = 3;
         let skip_certificate = Certificate {
             cert_type: CertificateType::Skip(target_slot),
-            signature: BLSSignature::default(),
+            signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
             bitmap: vec![],
         };
         events.clear();
@@ -713,7 +716,7 @@ mod tests {
         for slot in 1..next_leader_slot.0 {
             let skip_certificate = Certificate {
                 cert_type: CertificateType::Skip(slot),
-                signature: BLSSignature::default(),
+                signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
                 bitmap: vec![],
             };
 
@@ -783,12 +786,12 @@ mod tests {
         let certificates = vec![
             Arc::new(Certificate {
                 cert_type: CertificateType::Skip(1),
-                signature: BLSSignature::default(),
+                signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
                 bitmap: vec![],
             }),
             Arc::new(Certificate {
                 cert_type: CertificateType::Skip(2),
-                signature: BLSSignature::default(),
+                signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
                 bitmap: vec![],
             }),
         ];
@@ -823,7 +826,7 @@ mod tests {
 
         let certificates = vec![Arc::new(Certificate {
             cert_type: CertificateType::Skip(1),
-            signature: BLSSignature::default(),
+            signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
             bitmap: vec![],
         })];
 
@@ -840,7 +843,7 @@ mod tests {
 
         let certificates = vec![Arc::new(Certificate {
             cert_type: CertificateType::Skip(1),
-            signature: BLSSignature::default(),
+            signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
             bitmap: vec![],
         })];
 

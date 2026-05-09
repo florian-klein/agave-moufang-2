@@ -19,11 +19,17 @@ Release channels have their own copy of this changelog:
 #### Changes
 ### Validator
 #### Breaking
+* `--block-production-method central-scheduler` is no longer supported. If passed, a warning is emitted and behavior
+  will default to the greedy-scheduler implementation.
+* scheduler-bindings version has been increased to 4. Connecting external schedulers must be updated.
+* Validator now requires 26 ports, `--dynamic-port-range` must be at least 26 wide.
 #### Deprecations
 * Using `minimal` for `--accounts-index-limit` is now deprecated.
 * `--account-shrink-path` is now deprecated.
 * `sbf-sdk.tar.bz2` is not included anymore in the Agave release tarball. The file will be made available in the new
   [`cargo-build-sbf`](https://github.com/anza-xyz/cargo-build-sbf) repository.
+* XDP support is no longer experimental. The `--experimental-retransmit-xdp-interface`, `--experimental-retransmit-xdp-cpu-cores`, and
+  `--experimental-retransmit-xdp-zero-copy` flags have been deprecated. Use `--xdp-interface`, `--xdp-cpu-cores`, and `--xdp-zero-copy` instead. Behavior is unchanged: pass `--xdp-cpu-cores` to enable XDP on the specified cores.
 #### Changes
 
 ## 4.0.0
@@ -121,6 +127,7 @@ prerelease version. The new interpretation is as follows:
 * `agave-validator exit` now saves bank state before exiting. This enables restarts from local state when snapshot generation is disabled.
 * Added `--accounts-index-limit` to specify the memory limit of the accounts index.
 * Snapshot archive unpacking now uses direct I/O by default to improve performance by bypassing the OS page cache. Use `--no-accounts-db-snapshots-direct-io` to opt out if your file system does not support `O_DIRECT`. Direct I/O will be extended to snapshot creation in a future release.
+* `--block-production-method central-scheduler` is now deprecated and will be removed in a future release. Use `central-scheduler-greedy` instead.
 ### CLI
 #### Breaking
 * Removed deprecated arguments

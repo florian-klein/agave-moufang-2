@@ -36,7 +36,6 @@ solana-bincode = { workspace = true }
 solana-clock = { workspace = true }
 solana-instruction = { workspace = true }
 solana-loader-v3-interface = { workspace = true, features = ["serde"] }
-solana-loader-v4-interface = { workspace = true, features = ["bincode"] }
 solana-packet = { workspace = true }
 solana-program-runtime = { workspace = true }
 solana-pubkey = { workspace = true }
@@ -65,6 +64,7 @@ solana-pubkey = { workspace = true, features = ["rand"] }
 solana-rent = { workspace = true }
 solana-slot-hashes = { workspace = true }
 solana-svm-callback = { path = "../../svm-callback", features = ["agave-unstable-api"] }
+solana-system-program = { workspace = true }
 solana-transaction-context = { path = "../../transaction-context", features = ["agave-unstable-api", "bincode", "dev-context-only-utils"] }
 static_assertions = { workspace = true }
 test-case = { workspace = true }

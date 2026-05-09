@@ -40,9 +40,14 @@ frozen-abi = [
 ]
 
 [dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
 agave-banking-stage-ingress-types = { workspace = true }
 agave-bls-cert-verify = { workspace = true }
 agave-feature-set = { workspace = true }
+agave-fs = { workspace = true }
 agave-logger = { workspace = true }
 agave-math-utils = { workspace = true }
 agave-scheduler-bindings = { workspace = true }
@@ -72,9 +77,6 @@ log = { workspace = true }
 min-max-heap = { workspace = true }
 num_cpus = { workspace = true }
 num_enum = { workspace = true }
-prio-graph = { workspace = true }
-prost = { workspace = true }
-prost-types = { workspace = true }
 qualifier_attr = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
@@ -172,8 +174,6 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
-tonic = { workspace = true }
-tonic-prost = { workspace = true }
 trees = { workspace = true }
 wincode = { workspace = true }
 
@@ -188,7 +188,7 @@ bitvec = { workspace = true }
 criterion = { workspace = true }
 serial_test = { workspace = true }
 solana-account = { workspace = true, features = ["dev-context-only-utils"] }
-solana-bpf-loader-program = { path = "../programs/bpf_loader", default-features = false, features = ["agave-unstable-api"] }
+solana-bpf-loader-program = { path = "../programs/bpf_loader", default-features = false, features = ["agave-unstable-api", "svm-internal"] }
 solana-client = { path = "../client", features = ["dev-context-only-utils"] }
 solana-compute-budget = { workspace = true }
 solana-compute-budget-interface = { workspace = true }
@@ -219,12 +219,6 @@ test-case = { workspace = true }
 jemallocator = { workspace = true }
 
 [[bench]]
-name = "banking_stage"
-
-[[bench]]
-name = "gen_keys"
-
-[[bench]]
 name = "sigverify_stage"
 harness = false
 
@@ -234,10 +228,6 @@ harness = false
 
 [[bench]]
 name = "shredder"
-harness = false
-
-[[bench]]
-name = "receive_and_buffer"
 harness = false
 
 [lints]

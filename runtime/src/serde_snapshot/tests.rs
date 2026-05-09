@@ -211,15 +211,17 @@ mod serde_snapshot_tests {
         let pubkeys: Vec<_> = std::iter::repeat_with(solana_pubkey::new_rand)
             .take(100)
             .collect();
+        let ancestors = Ancestors::from(vec![slot]);
+
         for (i, pubkey) in pubkeys.iter().enumerate() {
             let account = AccountSharedData::new(i as u64 + 1, 0, &Pubkey::default());
-            accounts.store_accounts_seq((slot, [(pubkey, &account)].as_slice()), None, None);
+            accounts.store_accounts_seq((slot, [(pubkey, &account)].as_slice()), None, &ancestors);
         }
         check_accounts_local(&accounts, &pubkeys, 100);
         accounts.accounts_db.add_root_and_flush_write_cache(slot);
         let accounts_hash = accounts
             .accounts_db
-            .calculate_accounts_lt_hash_at_startup_from_index(&Ancestors::default(), slot);
+            .calculate_accounts_lt_hash_at_startup_from_index(&Ancestors::default());
 
         let mut writer = Cursor::new(vec![]);
         account_storages_to_stream(
@@ -254,7 +256,7 @@ mod serde_snapshot_tests {
         check_accounts_local(&daccounts, &pubkeys, 100);
         let daccounts_hash = accounts
             .accounts_db
-            .calculate_accounts_lt_hash_at_startup_from_index(&Ancestors::default(), slot);
+            .calculate_accounts_lt_hash_at_startup_from_index(&Ancestors::default());
         assert_eq!(accounts_hash, daccounts_hash);
     }
 
@@ -393,8 +395,8 @@ mod serde_snapshot_tests {
             daccounts.check_storage(2, 31, 31);
 
             assert_eq!(
-                daccounts.calculate_accounts_lt_hash_at_startup_from_index(&ancestors, latest_slot),
-                accounts.calculate_accounts_lt_hash_at_startup_from_index(&ancestors, latest_slot),
+                daccounts.calculate_accounts_lt_hash_at_startup_from_index(&ancestors),
+                accounts.calculate_accounts_lt_hash_at_startup_from_index(&ancestors),
             );
         }
     }
@@ -508,7 +510,7 @@ mod serde_snapshot_tests {
         accounts.assert_load_account(current_slot, dummy_pubkey, dummy_lamport);
 
         let calculated_capitalization =
-            accounts.calculate_capitalization_at_startup_from_index(&Ancestors::default(), 4);
+            accounts.calculate_capitalization_at_startup_from_index(&Ancestors::default());
         let expected_capitalization = 1_222;
         assert_eq!(calculated_capitalization, expected_capitalization);
     }
@@ -811,21 +813,21 @@ mod serde_snapshot_tests {
 
             let no_ancestors = Ancestors::default();
 
-            let calculated_capitalization = accounts
-                .calculate_capitalization_at_startup_from_index(&no_ancestors, current_slot);
+            let calculated_capitalization =
+                accounts.calculate_capitalization_at_startup_from_index(&no_ancestors);
             let expected_capitalization = 22_300;
             assert_eq!(calculated_capitalization, expected_capitalization);
 
-            let accounts_lt_hash_pre = accounts
-                .calculate_accounts_lt_hash_at_startup_from_index(&no_ancestors, current_slot);
+            let accounts_lt_hash_pre =
+                accounts.calculate_accounts_lt_hash_at_startup_from_index(&no_ancestors);
             let accounts = reconstruct_accounts_db_via_serialization(
                 &accounts,
                 current_slot,
                 storage_access,
                 ACCOUNTS_DB_CONFIG_FOR_TESTING,
             );
-            let accounts_lt_hash_post = accounts
-                .calculate_accounts_lt_hash_at_startup_from_index(&no_ancestors, current_slot);
+            let accounts_lt_hash_post =
+                accounts.calculate_accounts_lt_hash_at_startup_from_index(&no_ancestors);
             assert_eq!(accounts_lt_hash_pre, accounts_lt_hash_post);
 
             // repeating should be no-op

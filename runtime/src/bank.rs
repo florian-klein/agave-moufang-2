@@ -39,9 +39,7 @@ use {
         bank::{
             entry_bytes_budget::EntryBytesBudget,
             metrics::*,
-            partitioned_epoch_rewards::{
-                CachedVoteAccounts, EpochRewardStatus, RewardCommissionAccounts,
-            },
+            partitioned_epoch_rewards::{CachedVoteAccounts, EpochRewardStatus},
         },
         bank_forks::BankForks,
         block_component_processor::{
@@ -90,7 +88,7 @@ use {
     solana_accounts_db::{
         account_locks::validate_account_locks,
         account_storage_entry::AccountStorageEntry,
-        accounts::{AccountAddressFilter, Accounts, PubkeyAccountSlot},
+        accounts::{AccountAddressFilter, Accounts},
         accounts_db::{AccountsDb, AccountsDbConfig},
         accounts_hash::AccountsLtHash,
         accounts_index::IndexKey,
@@ -133,7 +131,7 @@ use {
         loaded_programs::{ProgramRuntimeEnvironment, ProgramRuntimeEnvironments},
         program_cache_entry::ProgramCacheEntry,
     },
-    solana_pubkey::{Pubkey, PubkeyHasherBuilder},
+    solana_pubkey::Pubkey,
     solana_rent::Rent,
     solana_runtime_transaction::{
         runtime_transaction::RuntimeTransaction, transaction_with_meta::TransactionWithMeta,
@@ -972,15 +970,6 @@ pub struct Bank {
     pub block_component_processor: RwLock<BlockComponentProcessor>,
 }
 
-#[derive(Debug)]
-struct RewardCommission {
-    commission_account: AccountSharedData,
-    commission_bps: u16,
-    commission_lamports: u64,
-}
-
-type RewardCommissions = HashMap<Pubkey, RewardCommission, PubkeyHasherBuilder>;
-
 #[derive(Debug, Default)]
 pub struct NewBankOptions {
     pub vote_only_bank: bool,
@@ -1461,7 +1450,10 @@ impl Bank {
         let (_, update_sysvars_time_us) = measure_us!({
             new.update_slot_hashes();
             new.update_stake_history(Some(parent.epoch()));
-            new.update_clock(Some(parent.epoch()));
+            // Keep setting the tower clock sysvar till we have not migrated to Alpenglow.
+            if new.get_alpenglow_genesis_certificate().is_none() {
+                new.update_clock(Some(parent.epoch()));
+            }
             new.update_last_restart_slot()
         });
 
@@ -1779,13 +1771,15 @@ impl Bank {
 
         // Distribute rewards commission to vote accounts and cache stake rewards
         // for partitioned distribution in the upcoming slots.
-        let epoch_validator_rewards = self.begin_partitioned_rewards(
-            parent_epoch,
-            parent_slot,
-            parent_height,
-            &rewards_calculation,
-            &rewards_metrics,
-        );
+        let (epoch_validator_rewards, begin_partitioned_rewards_time_us) =
+            measure_us!(self.begin_partitioned_rewards(
+                parent_epoch,
+                parent_slot,
+                parent_height,
+                &rewards_calculation,
+                &mut rewards_metrics,
+                &thread_pool,
+            ));
 
         // the vote reward account state should be created at the epoch boundary in which we
         // activate alpenglow as it will need info from the previous epoch.
@@ -1808,6 +1802,7 @@ impl Bank {
                 calculate_activated_stake_time_us,
                 update_epoch_stakes_time_us,
                 update_rewards_with_thread_pool_time_us,
+                begin_partitioned_rewards_time_us,
             },
             rewards_metrics,
         );
@@ -2588,60 +2583,6 @@ impl Bank {
         (validator_rate * capitalization as f64 * epoch_duration_in_years) as u64
     }
 
-    /// Convert computed RewardCommissions to RewardCommissionAccounts for storing.
-    ///
-    /// This function processes reward commissions and consolidates them into a
-    /// single structure containing the pubkey, reward info, and updated account
-    /// data for each commission account. The resulting structure is optimized
-    /// for storage by combining previously separate rewards and accounts
-    /// vectors into a single accounts_with_rewards vector.
-    fn calculate_commission_accounts(
-        reward_commissions: RewardCommissions,
-    ) -> RewardCommissionAccounts {
-        let mut result = RewardCommissionAccounts {
-            accounts_with_rewards: Vec::with_capacity(reward_commissions.len()),
-            total_reward_commission_lamports: 0,
-        };
-        for (
-            commission_pubkey,
-            RewardCommission {
-                mut commission_account,
-                commission_bps,
-                commission_lamports,
-            },
-        ) in reward_commissions
-        {
-            if let Err(err) = commission_account.checked_add_lamports(commission_lamports) {
-                debug!("reward redemption failed for {commission_pubkey}: {err:?}");
-                continue;
-            }
-
-            result.accounts_with_rewards.push((
-                commission_pubkey,
-                RewardInfo {
-                    reward_type: RewardType::Voting,
-                    lamports: commission_lamports as i64,
-                    post_balance: commission_account.lamports(),
-                    commission_bps: Some(commission_bps),
-                },
-                commission_account,
-            ));
-            result.total_reward_commission_lamports += commission_lamports;
-        }
-        result
-    }
-
-    fn update_reward_commissions(&self, reward_commission_accounts: &RewardCommissionAccounts) {
-        let mut rewards = self.rewards.write().unwrap();
-        rewards.reserve(reward_commission_accounts.accounts_with_rewards.len());
-        reward_commission_accounts
-            .accounts_with_rewards
-            .iter()
-            .for_each(|(commission_pubkey, reward_commission, _)| {
-                rewards.push((*commission_pubkey, *reward_commission));
-            });
-    }
-
     fn update_recent_blockhashes_locked(&self, locked_blockhash_queue: &BlockhashQueue) {
         #[expect(deprecated)]
         self.update_sysvar_account(&sysvar::recent_blockhashes::id(), |account| {
@@ -2861,11 +2802,13 @@ impl Bank {
 
         // After storing genesis accounts, the bank stakes cache will be warmed
         // up and can be used to set the leader id to the highest staked
-        // node. If no staked nodes exist, allow fallback to an unstaked test
-        // leader during tests.
+        // node.
         let leader = self.stakes_cache.stakes().highest_staked_node();
+        // If a leader is specified for test purposes, use that and if no leader found, use a random one.
         #[cfg(feature = "dev-context-only-utils")]
-        let leader = leader.or(leader_for_tests);
+        let leader = leader_for_tests
+            .or(leader)
+            .or(Some(SlotLeader::new_unique()));
         self.leader = leader.expect("genesis processing failed because no staked nodes exist");
 
         #[cfg(not(feature = "dev-context-only-utils"))]
@@ -4011,11 +3954,9 @@ impl Bank {
             self.update_bank_hash_stats(&to_store);
             // See https://github.com/solana-labs/solana/pull/31455 for discussion
             // on *not* updating the index within a threadpool.
-            self.rc.accounts.store_accounts_seq(
-                to_store,
-                transactions.as_deref(),
-                Some(&self.ancestors),
-            );
+            self.rc
+                .accounts
+                .store_accounts_seq(to_store, transactions.as_deref(), &self.ancestors);
         });
 
         // Cached vote and stake accounts are synchronized with accounts-db
@@ -4390,7 +4331,7 @@ impl Bank {
         self.update_bank_hash_stats(&accounts);
         self.rc
             .accounts
-            .store_accounts_par(accounts, None, Some(&self.ancestors));
+            .store_accounts_par(accounts, None, &self.ancestors);
         m.stop();
         self.rc
             .accounts
@@ -4758,13 +4699,6 @@ impl Bank {
         self.rc.accounts.account_indexes_include_key(key)
     }
 
-    /// Returns all the accounts this bank can load
-    pub fn get_all_accounts(&self, sort_results: bool) -> ScanResult<Vec<PubkeyAccountSlot>> {
-        self.rc
-            .accounts
-            .load_all(&self.ancestors, self.bank_id, sort_results)
-    }
-
     // Scans all the accounts this bank can load, applying `scan_func`
     pub fn scan_all_accounts<F>(&self, scan_func: F) -> ScanResult<()>
     where
@@ -5074,7 +5008,7 @@ impl Bank {
             check_lt_hash(&expected_accounts_lt_hash, calculated_accounts_lt_hash)
         } else {
             let calculated_accounts_lt_hash =
-                accounts_db.calculate_accounts_lt_hash_at_startup_from_index(&self.ancestors, slot);
+                accounts_db.calculate_accounts_lt_hash_at_startup_from_index(&self.ancestors);
             check_lt_hash(&expected_accounts_lt_hash, &calculated_accounts_lt_hash)
         };
         info!("Verifying accounts... Done in {:?}", start.elapsed());
@@ -5118,8 +5052,10 @@ impl Bank {
         tx: VersionedTransaction,
         verification_mode: TransactionVerificationMode,
     ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
-        // Discard v1 transactions until support is added.
-        if tx.version() == TransactionVersion::Number(1) {
+        // Discard v1 transactions until feature gate is activated.
+        if !self.feature_set.snapshot().enable_tx_v1
+            && tx.version() == TransactionVersion::Number(1)
+        {
             return Err(TransactionError::UnsupportedVersion);
         }
 
@@ -5139,10 +5075,17 @@ impl Bank {
         serialized_message: &[u8],
         verification_mode: TransactionVerificationMode,
     ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
-        // Discard v1 transactions until support is added.
-        if tx.version() == TransactionVersion::Number(1) {
+        // Discard v1 transactions until feature gate is activated.
+        let enable_tx_v1 = self.feature_set.snapshot().enable_tx_v1;
+        if !enable_tx_v1 && tx.version() == TransactionVersion::Number(1) {
             return Err(TransactionError::UnsupportedVersion);
         }
+        let max_transaction_size = match tx.version() {
+            TransactionVersion::Number(1) if enable_tx_v1 => {
+                solana_message::v1::MAX_TRANSACTION_SIZE
+            }
+            _ => PACKET_DATA_SIZE,
+        } as u64;
 
         let enable_instruction_account_limit =
             self.feature_set.snapshot().limit_instruction_accounts;
@@ -5152,7 +5095,7 @@ impl Bank {
         let sanitized_tx = {
             let size =
                 wincode::serialized_size(&tx).map_err(|_| TransactionError::SanitizeFailure)?;
-            if size > PACKET_DATA_SIZE as u64 {
+            if size > max_transaction_size {
                 return Err(TransactionError::SanitizeFailure);
             }
 
@@ -5236,7 +5179,7 @@ impl Bank {
         self.rc
             .accounts
             .accounts_db
-            .calculate_capitalization_at_startup_from_index(&self.ancestors, self.slot())
+            .calculate_capitalization_at_startup_from_index(&self.ancestors)
     }
 
     /// Sets the capitalization.
@@ -6098,17 +6041,19 @@ impl Bank {
     ///
     /// Panics if total overflows a u64.
     ///
-    /// Note, this may be *very* expensive, as *all* accounts are collected
-    /// into a Vec before summing each account's data size.
+    /// Note, this may be *very* expensive, as *all* accounts are accessed.
     ///
     /// Only intended to be called by tests or when the number of accounts is small.
     pub fn calculate_accounts_data_size(&self) -> ScanResult<u64> {
-        let accounts = self.get_all_accounts(false)?;
-        let accounts_data_size = accounts
-            .into_iter()
-            .map(|(_pubkey, account, _slot)| account.data().len() as u64)
-            .try_fold(0, u64::checked_add)
-            .expect("accounts data size cannot overflow");
+        let mut accounts_data_size: u64 = 0;
+        self.scan_all_accounts(|address_account_slot| {
+            let Some((_address, account, _slot)) = address_account_slot else {
+                return;
+            };
+            accounts_data_size = accounts_data_size
+                .checked_add(account.data().len() as u64)
+                .expect("accounts data size cannot overflow");
+        })?;
         Ok(accounts_data_size)
     }
 
@@ -6390,7 +6335,7 @@ impl Bank {
     }
 
     pub fn new_for_tests(genesis_config: &GenesisConfig) -> Self {
-        Self::new_with_config_for_tests(genesis_config, BankTestConfig::default())
+        Self::new_with_paths_for_tests(genesis_config, None, vec![], None)
     }
 
     pub fn new_with_mockup_builtin_for_tests(
@@ -6403,32 +6348,21 @@ impl Bank {
         bank.wrap_with_bank_forks_for_tests()
     }
 
-    pub fn new_with_config_for_tests(
-        genesis_config: &GenesisConfig,
-        test_config: BankTestConfig,
-    ) -> Self {
-        Self::new_with_paths_for_tests(
-            genesis_config,
-            Arc::new(RuntimeConfig::default()),
-            test_config,
-            Vec::new(),
-        )
-    }
-
     pub fn new_with_paths_for_tests(
         genesis_config: &GenesisConfig,
-        runtime_config: Arc<RuntimeConfig>,
-        test_config: BankTestConfig,
+        test_config: Option<BankTestConfig>,
         paths: Vec<PathBuf>,
+        leader: Option<SlotLeader>,
     ) -> Self {
+        let test_config = test_config.unwrap_or_default();
         let mut bank = Self::new_from_genesis(
             genesis_config,
-            runtime_config,
+            Arc::new(RuntimeConfig::default()),
             paths,
             None,
             test_config.accounts_db_config,
             None,
-            Some(SlotLeader::new_unique()),
+            leader,
             Arc::default(),
             None,
             None,
@@ -6535,7 +6469,7 @@ impl Bank {
         self.rc
             .accounts
             .accounts_db
-            .calculate_accounts_lt_hash_at_startup_from_index(&self.ancestors, self.slot)
+            .calculate_accounts_lt_hash_at_startup_from_index(&self.ancestors)
     }
 
     pub fn get_transaction_processor(&self) -> &TransactionBatchProcessor<BankForks> {

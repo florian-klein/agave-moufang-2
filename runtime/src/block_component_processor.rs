@@ -1,7 +1,9 @@
 use {
     crate::{
         bank::Bank,
-        block_component_processor::vote_reward::calculate_and_pay_voting_reward_and_update_vote_state,
+        block_component_processor::vote_reward::{
+            CalcVoteRewardUpdateVoteStatesError, calc_vote_rewards_update_vote_states,
+        },
         validated_block_finalization::{
             BlockFinalizationCertError, ValidatedBlockFinalizationCert,
         },
@@ -21,13 +23,19 @@ use {
     },
     solana_hash::Hash,
     solana_pubkey::Pubkey,
-    std::{num::NonZeroU64, sync::Arc},
+    std::{collections::HashSet, num::NonZeroU64, sync::Arc},
     thiserror::Error,
 };
 
 pub(crate) mod vote_reward;
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error)]
+pub enum BankFooterError {
+    #[error("calc vote rewards updating vote states failed with \"{0}\"")]
+    CalcVoteRewardUpdateVoteStates(#[from] CalcVoteRewardUpdateVoteStatesError),
+}
+
+#[derive(Debug, Error)]
 pub enum BlockComponentProcessorError {
     #[error("BlockComponent detected pre-migration")]
     BlockComponentPreMigration,
@@ -49,6 +57,13 @@ pub enum BlockComponentProcessorError {
     MultipleBlockFooters,
     #[error("Multiple block headers detected")]
     MultipleBlockHeaders,
+    #[error(
+        "Block header parent slot mismatch: header={header_parent_slot}, bank={bank_parent_slot}"
+    )]
+    HeaderParentSlotMismatch {
+        header_parent_slot: Slot,
+        bank_parent_slot: Slot,
+    },
     #[error("Multiple update parents detected")]
     MultipleUpdateParents,
     #[error("Nanosecond clock out of bounds")]
@@ -59,6 +74,8 @@ pub enum BlockComponentProcessorError {
     AbandonedBank(VersionedUpdateParent),
     #[error("invalid reward certs {0}")]
     InvalidRewardCerts(#[from] ValidatedRewardCertError),
+    #[error("updating bank footer failed with \"{0}\"")]
+    UpdateBankFooter(#[from] BankFooterError),
 }
 
 #[derive(Default)]
@@ -79,7 +96,21 @@ impl BlockComponentProcessor {
             return Ok(());
         }
 
-        // TODO(ksn): re-introduce on-final logic as we continue upstreaming
+        // If we encounter an UpdateParent when fast leader handover is disabled, error.
+        if !migration_status.should_allow_fast_leader_handover(slot) && self.update_parent.is_some()
+        {
+            return Err(BlockComponentProcessorError::SpuriousUpdateParent);
+        }
+
+        // Post-migration: both header and footer are required
+        if !self.has_footer {
+            return Err(BlockComponentProcessorError::MissingBlockFooter);
+        }
+
+        if !self.has_header && self.update_parent.is_none() {
+            return Err(BlockComponentProcessorError::MissingParentMarker);
+        }
+
         Ok(())
     }
 
@@ -96,7 +127,11 @@ impl BlockComponentProcessor {
             return Ok(());
         }
 
-        // TODO(ksn): re-introduce on_entry_batch logic as we continue upstreaming
+        // We must have either a header or an update parent prior to processing entry batches.
+        if !self.has_header && self.update_parent.is_none() {
+            return Err(BlockComponentProcessorError::MissingParentMarker);
+        }
+
         Ok(())
     }
 
@@ -125,7 +160,7 @@ impl BlockComponentProcessor {
             // - once migration is fully enabled, or
             // - while we're still in the migration phase (to let us advance it)
             BlockMarkerV1::BlockHeader(header) if markers_fully_enabled || in_migration => {
-                self.on_header(header.inner())
+                self.on_header(header.inner(), bank.parent_slot())
             }
             BlockMarkerV1::GenesisCertificate(genesis_cert)
                 if markers_fully_enabled || in_migration =>
@@ -260,36 +295,47 @@ impl BlockComponentProcessor {
             notar_reward_cert,
         } = footer;
 
-        let reward_slot_and_validators =
-            match ValidatedRewardCert::try_new(&bank, &skip_reward_cert, &notar_reward_cert) {
-                Ok(c) => Some(c.into_parts()),
-                Err(ValidatedRewardCertError::Empty) => None,
-                Err(e) => return Err(e.into()),
-            };
-        let validated_final_cert = final_cert
+        let reward_cert =
+            ValidatedRewardCert::try_new(&bank, &skip_reward_cert, &notar_reward_cert)?;
+        let final_cert = final_cert
             .map(|final_cert| {
                 ValidatedBlockFinalizationCert::try_from_footer(final_cert, &bank)
                     .map_err(BlockComponentProcessorError::InvalidFinalizationCertificate)
             })
             .transpose()?;
 
+        let (footer_input, pool_input) = match final_cert {
+            None => (None, None),
+            Some(cert) => {
+                let (signers, finalize_cert, notarize_cert) = cert.into_parts();
+                let final_slot = finalize_cert.cert_type.slot();
+                (
+                    Some((signers, final_slot)),
+                    Some((finalize_cert, notarize_cert)),
+                )
+            }
+        };
+
         Self::update_bank_with_footer_fields(
             &bank,
             block_producer_time_nanos as i64,
             bank_hash,
-            reward_slot_and_validators,
-            validated_final_cert.as_ref(),
-        );
+            reward_cert,
+            footer_input
+                .as_ref()
+                .map(|(validators, slot)| (validators, *slot)),
+        )?;
 
         // Send finalization cert(s) to consensus pool
-        if let Some(validated) = validated_final_cert {
+        if let Some((finalize_cert, notarize_cert)) = pool_input {
             if let Some(sender) = finalization_cert_sender {
-                let (finalize_cert, notarize_cert) = validated.into_certificates();
                 if let Some(notarize_cert) = notarize_cert {
+                    // TODO blocking send.
                     let _ = sender
                         .send(vec![ConsensusMessage::from(notarize_cert)])
                         .inspect_err(|_| info!("ConsensusMessage sender disconnected"));
                 }
+                // TODO blocking send.
                 let _ = sender
                     .send(vec![ConsensusMessage::from(finalize_cert)])
                     .inspect_err(|_| info!("ConsensusMessage sender disconnected"));
@@ -302,7 +348,8 @@ impl BlockComponentProcessor {
 
     fn on_header(
         &mut self,
-        _header: &VersionedBlockHeader,
+        header: &VersionedBlockHeader,
+        bank_parent_slot: Slot,
     ) -> Result<(), BlockComponentProcessorError> {
         if self.has_header {
             return Err(BlockComponentProcessorError::MultipleBlockHeaders);
@@ -310,6 +357,14 @@ impl BlockComponentProcessor {
 
         if self.update_parent.is_some() {
             return Err(BlockComponentProcessorError::SpuriousUpdateParent);
+        }
+
+        let VersionedBlockHeader::V1(header) = header;
+        if header.parent_slot != bank_parent_slot {
+            return Err(BlockComponentProcessorError::HeaderParentSlotMismatch {
+                header_parent_slot: header.parent_slot,
+                bank_parent_slot,
+            });
         }
 
         self.has_header = true;
@@ -392,20 +447,14 @@ impl BlockComponentProcessor {
         bank: &Bank,
         block_producer_time_nanos: i64,
         bank_hash: Hash,
-        reward_slot_and_validators: Option<(Slot, Vec<Pubkey>)>,
-        final_cert: Option<&ValidatedBlockFinalizationCert>,
-    ) {
-        // Update clock sysvar
+        reward_cert: Option<ValidatedRewardCert>,
+        final_cert_input: Option<(&HashSet<Pubkey>, Slot)>,
+    ) -> Result<(), BankFooterError> {
         bank.update_clock_from_footer(block_producer_time_nanos);
-
-        calculate_and_pay_voting_reward_and_update_vote_state(
-            bank,
-            reward_slot_and_validators,
-            final_cert,
-        )
-        .unwrap();
+        calc_vote_rewards_update_vote_states(bank, reward_cert, final_cert_input)?;
         // Record expected bank hash from footer for later verification when the bank is frozen.
         bank.set_expected_bank_hash(bank_hash);
+        Ok(())
     }
 }
 
@@ -452,24 +501,20 @@ mod tests {
         )
     }
 
-    // TODO(ksn): re-enable once broadcast stage produces block headers
     #[test]
-    #[ignore]
     fn test_missing_header_error_on_entry_batch() {
         let migration_status = MigrationStatus::post_migration_status();
         let mut processor = BlockComponentProcessor::default();
 
         // Try to process entry batch without header - should fail
         let result = processor.on_entry_batch(&migration_status, 1);
-        assert_eq!(
+        assert!(matches!(
             result,
             Err(BlockComponentProcessorError::MissingParentMarker)
-        );
+        ));
     }
 
-    // TODO(ksn): re-enable once broadcast stage produces block footers
     #[test]
-    #[ignore]
     fn test_missing_footer_error_on_slot_full() {
         let migration_status = MigrationStatus::post_migration_status();
         let processor = BlockComponentProcessor {
@@ -479,10 +524,10 @@ mod tests {
 
         // Try to mark slot as full without footer - should fail
         let result = processor.on_final(&migration_status, 1);
-        assert_eq!(
+        assert!(matches!(
             result,
             Err(BlockComponentProcessorError::MissingBlockFooter)
-        );
+        ));
     }
 
     #[test]
@@ -494,14 +539,14 @@ mod tests {
         });
 
         // First header should succeed
-        assert!(processor.on_header(&header).is_ok());
+        assert!(processor.on_header(&header, 0).is_ok());
 
         // Second header should fail
-        let result = processor.on_header(&header);
-        assert_eq!(
+        let result = processor.on_header(&header, 0);
+        assert!(matches!(
             result,
             Err(BlockComponentProcessorError::MultipleBlockHeaders)
-        );
+        ));
     }
 
     #[test]
@@ -536,10 +581,10 @@ mod tests {
 
         // Second footer should fail
         let result = processor.on_footer(bank, parent, footer, None);
-        assert_eq!(
+        assert!(matches!(
             result,
             Err(BlockComponentProcessorError::MultipleBlockFooters)
-        );
+        ));
     }
 
     #[test]
@@ -584,8 +629,25 @@ mod tests {
             parent_block_id: Hash::default(),
         });
 
-        processor.on_header(&header).unwrap();
+        processor.on_header(&header, 0).unwrap();
         assert!(processor.has_header);
+    }
+
+    #[test]
+    fn test_on_header_parent_slot_mismatch_error() {
+        let mut processor = BlockComponentProcessor::default();
+        let header = VersionedBlockHeader::V1(BlockHeaderV1 {
+            parent_slot: 2,
+            parent_block_id: Hash::default(),
+        });
+
+        assert!(matches!(
+            processor.on_header(&header, 0),
+            Err(BlockComponentProcessorError::HeaderParentSlotMismatch {
+                header_parent_slot: 2,
+                bank_parent_slot: 0,
+            })
+        ));
     }
 
     #[test]
@@ -604,6 +666,27 @@ mod tests {
             .on_marker(bank, parent, marker, None, &migration_status)
             .unwrap();
         assert!(processor.has_header);
+    }
+
+    #[test]
+    fn test_on_marker_rejects_header_parent_slot_mismatch() {
+        let migration_status = MigrationStatus::post_migration_status();
+        let mut processor = BlockComponentProcessor::default();
+        let marker = VersionedBlockMarker::new_block_header(BlockHeaderV1 {
+            parent_slot: 7, // mismatches bank.parent_slot() below (0)
+            parent_block_id: Hash::default(),
+        });
+
+        let (parent, bank_forks) = create_test_bank();
+        let bank = create_child_bank(&bank_forks, &parent, 1);
+
+        assert!(matches!(
+            processor.on_marker(bank, parent, marker, None, &migration_status),
+            Err(BlockComponentProcessorError::HeaderParentSlotMismatch {
+                header_parent_slot: 7,
+                bank_parent_slot: 0,
+            })
+        ));
     }
 
     #[test]
@@ -657,7 +740,7 @@ mod tests {
             parent_slot: 0,
             parent_block_id: Hash::default(),
         });
-        processor.on_header(&header).unwrap();
+        processor.on_header(&header, bank.parent_slot()).unwrap();
 
         // Process some entry batches (not full yet)
         assert!(processor.on_entry_batch(&migration_status, 1).is_ok());
@@ -697,10 +780,10 @@ mod tests {
         });
 
         let result = processor.on_marker(bank, parent, marker, None, &migration_status);
-        assert_eq!(
+        assert!(matches!(
             result,
             Err(BlockComponentProcessorError::BlockComponentPreMigration)
-        );
+        ));
     }
 
     #[test]
@@ -720,7 +803,7 @@ mod tests {
         });
 
         let mut processor = BlockComponentProcessor::default();
-        assert_eq!(
+        assert!(matches!(
             processor.on_marker(
                 bank.clone(),
                 parent.clone(),
@@ -729,7 +812,7 @@ mod tests {
                 &migration_status
             ),
             Err(BlockComponentProcessorError::BlockComponentPreMigration)
-        );
+        ));
 
         let update_parent_marker = VersionedBlockMarker::new_update_parent(UpdateParentV1 {
             new_parent_slot: 0,
@@ -737,10 +820,10 @@ mod tests {
         });
 
         let mut processor = BlockComponentProcessor::default();
-        assert_eq!(
+        assert!(matches!(
             processor.on_marker(bank, parent, update_parent_marker, None, &migration_status),
             Err(BlockComponentProcessorError::BlockComponentPreMigration)
-        );
+        ));
     }
 
     #[test]
@@ -825,10 +908,10 @@ mod tests {
 
         // Try to process footer without header - should fail
         let result = processor.on_footer(bank, parent, footer, None);
-        assert_eq!(
+        assert!(matches!(
             result,
             Err(BlockComponentProcessorError::MissingParentMarker)
-        );
+        ));
     }
 
     #[test]
@@ -985,10 +1068,10 @@ mod tests {
         if should_pass {
             assert!(result.is_ok());
         } else {
-            assert_eq!(
+            assert!(matches!(
                 result,
                 Err(BlockComponentProcessorError::NanosecondClockOutOfBounds)
-            );
+            ));
         }
     }
 
@@ -1106,10 +1189,13 @@ mod tests {
     fn test_update_parent_after_header_abandoned_bank() {
         let mut processor = BlockComponentProcessor::default();
         processor
-            .on_header(&VersionedBlockHeader::V1(BlockHeaderV1 {
-                parent_slot: 0,
-                parent_block_id: Hash::default(),
-            }))
+            .on_header(
+                &VersionedBlockHeader::V1(BlockHeaderV1 {
+                    parent_slot: 0,
+                    parent_block_id: Hash::default(),
+                }),
+                0,
+            )
             .unwrap();
 
         let update_parent = VersionedUpdateParent::V1(UpdateParentV1 {
@@ -1135,10 +1221,10 @@ mod tests {
         processor.on_update_parent(&update_parent).unwrap();
 
         // Second should fail
-        assert_eq!(
+        assert!(matches!(
             processor.on_update_parent(&update_parent),
             Err(BlockComponentProcessorError::MultipleUpdateParents)
-        );
+        ));
     }
 
     #[test]
@@ -1156,10 +1242,10 @@ mod tests {
             parent_block_id: Hash::default(),
         });
 
-        assert_eq!(
-            processor.on_header(&header),
+        assert!(matches!(
+            processor.on_header(&header, 0),
             Err(BlockComponentProcessorError::SpuriousUpdateParent)
-        );
+        ));
     }
 
     #[test]

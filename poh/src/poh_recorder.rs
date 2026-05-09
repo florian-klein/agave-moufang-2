@@ -17,12 +17,15 @@ use {
         poh_controller::PohController, poh_service::PohService, record_channels::record_channels,
         transaction_recorder::TransactionRecorder,
     },
-    agave_votor_messages::migration::MigrationStatus,
+    agave_votor_messages::{
+        migration::MigrationStatus, reward_certificate::BuildRewardCertsRespError,
+    },
     arc_swap::ArcSwap,
     crossbeam_channel::{Receiver, SendError, Sender, TrySendError, bounded, unbounded},
     log::*,
     solana_clock::{BankId, Slot},
     solana_entry::{
+        block_component::{BlockFooterV1, VersionedBlockMarker},
         entry::Entry,
         entry_or_marker::EntryOrMarker,
         poh::{Poh, PohEntry},
@@ -33,7 +36,11 @@ use {
     solana_measure::measure_us,
     solana_poh_config::PohConfig,
     solana_pubkey::Pubkey,
-    solana_runtime::{bank::Bank, installed_scheduler_pool::BankWithScheduler},
+    solana_runtime::{
+        bank::Bank, block_component_processor::BankFooterError,
+        installed_scheduler_pool::BankWithScheduler,
+        validated_reward_certificate::Error as ValidatedRewardCertError,
+    },
     solana_transaction::versioned::VersionedTransaction,
     std::{
         cmp,
@@ -41,7 +48,7 @@ use {
             Arc, Mutex, RwLock,
             atomic::{AtomicBool, AtomicU64, Ordering},
         },
-        time::Instant,
+        time::{Duration, Instant},
     },
     thiserror::Error,
 };
@@ -49,7 +56,7 @@ use {
 pub const GRACE_TICKS_FACTOR: u64 = 2;
 pub const MAX_GRACE_SLOTS: u64 = 2;
 
-#[derive(Error, Debug, Clone)]
+#[derive(Debug, Error)]
 pub enum PohRecorderError {
     #[error("max height reached")]
     MaxHeightReached,
@@ -65,6 +72,15 @@ pub enum PohRecorderError {
 
     #[error("channel disconnected")]
     ChannelDisconnected,
+
+    #[error("producing reward certs failed with {0}")]
+    BuildRewardCerts(#[from] BuildRewardCertsRespError),
+
+    #[error("constructing validated reward cert failed with {0}")]
+    ValidatedRewardCert(#[from] ValidatedRewardCertError),
+
+    #[error("updating bank footer failed with \"{0}\"")]
+    UpdateBankFooter(#[from] BankFooterError),
 }
 
 pub(crate) type Result<T> = std::result::Result<T, PohRecorderError>;
@@ -305,6 +321,24 @@ impl PohRecorder {
         self.leader_last_tick_height = leader_last_tick_height;
     }
 
+    /// Send the block marker to be broadcast
+    pub fn send_marker(&mut self, marker: VersionedBlockMarker) -> Result<()> {
+        let tick_height = self.tick_height();
+        let working_bank = self
+            .working_bank
+            .as_mut()
+            .ok_or(PohRecorderError::MaxHeightReached)?;
+
+        self.working_bank_sender
+            .send((
+                working_bank.bank.clone(),
+                (EntryOrMarker::Marker(marker), tick_height),
+            ))
+            .unwrap();
+
+        Ok(())
+    }
+
     // Returns the index of `transactions.first()` in the slot, if being tracked by WorkingBank
     pub fn record(
         &mut self,
@@ -330,7 +364,7 @@ impl PohRecorder {
         }
 
         loop {
-            let (flush_cache_res, flush_cache_us) = measure_us!(self.flush_cache(false));
+            let (flush_cache_res, flush_cache_us) = measure_us!(self.flush_cache(false, None));
             self.metrics.flush_cache_no_tick_us += flush_cache_us;
             flush_cache_res?;
 
@@ -417,7 +451,7 @@ impl PohRecorder {
                 self.tick_height(),
             ));
 
-            let (_flush_res, flush_cache_and_tick_us) = measure_us!(self.flush_cache(true));
+            let (_flush_res, flush_cache_and_tick_us) = measure_us!(self.flush_cache(true, None));
             self.metrics.flush_cache_tick_us += flush_cache_and_tick_us;
         }
     }
@@ -461,7 +495,21 @@ impl PohRecorder {
 
         // TODO: adjust the working_bank.start time based on number of ticks
         // that have already elapsed based on current tick height.
-        let _ = self.flush_cache(false);
+        let _ = self.flush_cache(false, None);
+    }
+
+    fn notify_replay_wakeup(&self) {
+        if let Some(signal) = &self.clear_bank_signal {
+            match signal.try_send(true) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    trace!("replay wake up signal channel is full.")
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    trace!("replay wake up signal channel is disconnected.")
+                }
+            }
+        }
     }
 
     /// Clears the working bank.
@@ -501,17 +549,7 @@ impl PohRecorder {
             );
         }
 
-        if let Some(ref signal) = self.clear_bank_signal {
-            match signal.try_send(true) {
-                Ok(_) => {}
-                Err(TrySendError::Full(_)) => {
-                    trace!("replay wake up signal channel is full.")
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    trace!("replay wake up signal channel is disconnected.")
-                }
-            }
-        }
+        self.notify_replay_wakeup();
     }
 
     /// Returns tick_height - does not update the internal state for tick_height.
@@ -549,10 +587,70 @@ impl PohRecorder {
         tick_height
     }
 
+    /// Waits for the bank to freeze and sends the block footer with the bank hash.
+    /// Returns:
+    /// - Ok(()): Footer sent successfully
+    /// - Err(None): Bank freeze timeout (caller should break without updating send_result)
+    /// - Err(Some(e)): Send failed (caller should update send_result and break)
+    fn wait_for_freeze_and_send_footer(
+        &self,
+        mut footer: BlockFooterV1,
+        working_bank: &WorkingBank,
+    ) -> std::result::Result<(), Option<Box<SendError<WorkingBankEntryOrMarker>>>> {
+        // Wake replay as soon as the slot reaches max tick height so it can freeze the bank
+        // before we block on the footer/bank-hash handoff.
+        self.notify_replay_wakeup();
+
+        // Wait for the bank to be frozen with timeout
+        // TODO: change this to use DELTA_BLOCK from votor instead.
+        let start = Instant::now();
+        while !working_bank.bank.is_frozen() && !self.is_exited.load(Ordering::Relaxed) {
+            if start.elapsed() > Duration::from_millis(400) {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+
+        // If the bank still isn't frozen, we've timed out
+        if !working_bank.bank.is_frozen() {
+            if self.is_exited.load(Ordering::Relaxed) {
+                return Err(None);
+            }
+            error!(
+                "slot = {} block production failure. bank freezing timed out.",
+                working_bank.bank.slot()
+            );
+            return Err(None);
+        }
+
+        // Send out the block footer - we now have the bank hash
+        footer.bank_hash = working_bank.bank.hash();
+
+        let footer = VersionedBlockMarker::new_block_footer(footer);
+        let footer_entry_marker = (
+            EntryOrMarker::Marker(footer),
+            working_bank.max_tick_height - 1,
+        );
+
+        match self
+            .working_bank_sender
+            .send((working_bank.bank.clone(), footer_entry_marker))
+        {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                error!(
+                    "slot = {} block production failure. failed to broadcast footer",
+                    working_bank.bank.slot()
+                );
+                Err(Some(Box::new(err)))
+            }
+        }
+    }
+
     // Flush cache will delay flushing the cache for a bank until it past the WorkingBank::min_tick_height
     // On a record flush will flush the cache at the WorkingBank::min_tick_height, since a record
     // occurs after the min_tick_height was generated
-    fn flush_cache(&mut self, tick: bool) -> Result<()> {
+    fn flush_cache(&mut self, tick: bool, footer: Option<BlockFooterV1>) -> Result<()> {
         // check_tick_height is called before flush cache, so it cannot overrun the bank
         // so a bank that is so late that it's slot fully generated before it starts recording
         // will fail instead of broadcasting any ticks
@@ -572,7 +670,7 @@ impl PohRecorder {
             .iter()
             .take_while(|x| x.1 <= working_bank.max_tick_height)
             .count();
-        let mut send_result: std::result::Result<(), SendError<WorkingBankEntryOrMarker>> = Ok(());
+        let mut send_result = Ok(());
 
         if entry_count > 0 {
             trace!(
@@ -586,11 +684,24 @@ impl PohRecorder {
             for (entry, tick_height) in &self.tick_cache[..entry_count] {
                 working_bank.bank.register_tick(&entry.hash);
 
+                if let Some(footer) = footer.clone() {
+                    match self.wait_for_freeze_and_send_footer(footer, working_bank) {
+                        Ok(()) => {}        // Continue processing
+                        Err(None) => break, // Timeout - break without updating send_result
+                        Err(Some(e)) => {
+                            // Send failed - update send_result and break
+                            send_result = Err(e);
+                            break;
+                        }
+                    }
+                }
+
                 let tick = (EntryOrMarker::from(entry.clone()), *tick_height);
 
                 send_result = self
                     .working_bank_sender
-                    .send((working_bank.bank.clone(), tick));
+                    .send((working_bank.bank.clone(), tick))
+                    .map_err(Box::new);
                 if send_result.is_err() {
                     break;
                 }
@@ -922,7 +1033,7 @@ impl PohRecorder {
         self.clear_bank(true);
     }
 
-    pub fn tick_alpenglow(&mut self, slot_max_tick_height: u64) {
+    pub fn tick_alpenglow(&mut self, slot_max_tick_height: u64, footer: BlockFooterV1) {
         let (poh_entry, tick_lock_contention_us) = measure_us!({
             let mut poh_l = self.poh.lock().unwrap();
             poh_l.tick()
@@ -951,7 +1062,8 @@ impl PohRecorder {
                     .load(Ordering::Acquire),
             ));
 
-            let (_flush_res, flush_cache_and_tick_us) = measure_us!(self.flush_cache(true));
+            let (_flush_res, flush_cache_and_tick_us) =
+                measure_us!(self.flush_cache(true, Some(footer)));
             self.metrics.flush_cache_tick_us += flush_cache_and_tick_us;
         }
     }

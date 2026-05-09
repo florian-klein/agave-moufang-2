@@ -442,32 +442,6 @@ impl Accounts {
         self.accounts_db.account_indexes.include_key(key)
     }
 
-    pub fn load_all(
-        &self,
-        ancestors: &Ancestors,
-        bank_id: BankId,
-        sort_results: bool,
-    ) -> ScanResult<Vec<PubkeyAccountSlot>> {
-        let mut collector = Vec::new();
-        self.accounts_db.scan_accounts(
-            ancestors,
-            bank_id,
-            |some_account_tuple| {
-                if let Some((pubkey, account, slot)) =
-                    some_account_tuple.filter(|(_, account, _)| account.is_loadable())
-                {
-                    collector.push((*pubkey, account, slot))
-                }
-            },
-            &ScanConfig::default(),
-        )?;
-        if sort_results {
-            // Avoid copying pubkeys (using Ord::cmp(a, b) silences clippy::unnecessary_sort_by).
-            collector.sort_unstable_by(|(addr_a, _, _), (addr_b, _, _)| Ord::cmp(addr_a, addr_b));
-        }
-        Ok(collector)
-    }
-
     pub fn scan_all<F>(
         &self,
         ancestors: &Ancestors,
@@ -530,7 +504,7 @@ impl Accounts {
         &self,
         accounts: impl StorableAccounts<'a>,
         transactions: Option<&'a [&'a SanitizedTransaction]>,
-        ancestors: Option<&Ancestors>,
+        ancestors: &Ancestors,
     ) {
         self._store_accounts(
             accounts,
@@ -548,7 +522,7 @@ impl Accounts {
         &self,
         accounts: impl StorableAccounts<'a>,
         transactions: Option<&'a [&'a SanitizedTransaction]>,
-        ancestors: Option<&Ancestors>,
+        ancestors: &Ancestors,
     ) {
         self._store_accounts(
             accounts,
@@ -568,7 +542,7 @@ impl Accounts {
         accounts: impl StorableAccounts<'a>,
         transactions: Option<&'a [&'a SanitizedTransaction]>,
         update_index_thread_selection: UpdateIndexThreadSelection,
-        ancestors: Option<&Ancestors>,
+        ancestors: &Ancestors,
     ) {
         let accounts_db = &self.accounts_db;
         if accounts_db.has_accounts_update_notifier() {
@@ -1294,7 +1268,7 @@ mod tests {
         let accounts = Accounts::new(Arc::new(accounts_db));
         let mut old_pubkey = Pubkey::default();
         let zero_account = AccountSharedData::new(0, 0, AccountSharedData::default().owner());
-        info!("storing..");
+        info!("storing...");
         for i in 0..2_000 {
             let pubkey = solana_pubkey::new_rand();
             let account = AccountSharedData::new(i + 1, 0, AccountSharedData::default().owner());
@@ -1307,7 +1281,7 @@ mod tests {
                 info!("  store {i}");
             }
         }
-        info!("done..cleaning..");
+        info!("done. cleaning...");
         accounts.accounts_db.clean_accounts_for_tests();
     }
 

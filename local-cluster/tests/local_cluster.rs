@@ -41,10 +41,13 @@ use {
     solana_ledger::{
         ancestor_iterator::AncestorIterator,
         bank_forks_utils,
-        blockstore::{Blockstore, entries_to_test_shreds},
+        blockstore::{Blockstore, PurgeType, entries_to_test_shreds},
         blockstore_processor::{self, ProcessOptions},
         leader_schedule_cache::LeaderScheduleCache,
-        shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
+        shred::{
+            ProcessShredsStats, ReedSolomonCache, Shred, Shredder,
+            filter::{TurbineMode, TurbineModeKind},
+        },
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
     },
     solana_local_cluster::{
@@ -1007,11 +1010,12 @@ fn test_incremental_snapshot_download_with_crossing_full_snapshot_interval_at_st
         .unwrap();
 
         // Now get the same full snapshot on the LEADER that we just got from the validator
-        let mut leader_full_snapshots = snapshot_paths::get_full_snapshot_archives(
+        let mut leader_full_snapshots = snapshot_paths::full_snapshot_archives_iter(
             leader_snapshot_test_config
                 .full_snapshot_archives_dir
                 .path(),
-        );
+        )
+        .collect::<Vec<_>>();
         leader_full_snapshots.retain(|full_snapshot| {
             full_snapshot.slot() == validator_full_snapshot.slot()
                 && full_snapshot.hash() == validator_full_snapshot.hash()
@@ -1141,11 +1145,12 @@ fn test_incremental_snapshot_download_with_crossing_full_snapshot_interval_at_st
 
     // Check to make sure that the full snapshot the validator created during startup is the same
     // or one greater than the snapshot the leader created.
-    let validator_full_snapshot_archives = snapshot_paths::get_full_snapshot_archives(
+    let validator_full_snapshot_archives = snapshot_paths::full_snapshot_archives_iter(
         validator_snapshot_test_config
             .full_snapshot_archives_dir
             .path(),
-    );
+    )
+    .collect::<Vec<_>>();
     info!("validator full snapshot archives: {validator_full_snapshot_archives:#?}");
     let validator_full_snapshot_archive_for_comparison = validator_full_snapshot_archives
         .into_iter()
@@ -2251,15 +2256,14 @@ fn create_snapshot_to_hard_fork(
     .expect("must process blockstore from root");
 
     let bank = bank_forks.read().unwrap().get(snapshot_slot).unwrap();
-    let full_snapshot_archive_info = snapshot_bank_utils::bank_to_full_snapshot_archive(
-        ledger_path,
-        &bank,
-        Some(snapshot_config.snapshot_version),
-        ledger_path,
-        ledger_path,
-        snapshot_config.archive_format,
-    )
-    .unwrap();
+    let snapshot_config = SnapshotConfig {
+        full_snapshot_archives_dir: ledger_path.to_path_buf(),
+        incremental_snapshot_archives_dir: ledger_path.to_path_buf(),
+        bank_snapshots_dir: ledger_path.to_path_buf(),
+        ..SnapshotConfig::default()
+    };
+    let full_snapshot_archive_info =
+        snapshot_bank_utils::bank_to_full_snapshot_archive(&snapshot_config, &bank).unwrap();
     info!(
         "Successfully created snapshot for slot {}, hash {}: {}",
         bank.slot(),
@@ -5002,9 +5006,10 @@ fn test_boot_from_local_state() {
             );
             std::thread::yield_now();
         }
-        let other_full_snapshot_archives = snapshot_paths::get_full_snapshot_archives(
+        let other_full_snapshot_archives = snapshot_paths::full_snapshot_archives_iter(
             &other_validator_config.full_snapshot_archives_dir,
-        );
+        )
+        .collect::<Vec<_>>();
         debug!("validator{i} full snapshot archives: {other_full_snapshot_archives:?}");
         assert!(
             other_full_snapshot_archives
@@ -5027,9 +5032,11 @@ fn test_boot_from_local_state() {
                 .collect::<Vec<_>>(),
         );
 
-        let other_incremental_snapshot_archives = snapshot_paths::get_incremental_snapshot_archives(
-            &other_validator_config.incremental_snapshot_archives_dir,
-        );
+        let other_incremental_snapshot_archives =
+            snapshot_paths::incremental_snapshot_archives_iter(
+                &other_validator_config.incremental_snapshot_archives_dir,
+            )
+            .collect::<Vec<_>>();
         debug!(
             "validator{i} incremental snapshot archives: {other_incremental_snapshot_archives:?}"
         );
@@ -5117,12 +5124,14 @@ fn test_boot_from_local_state_missing_archive() {
     );
     debug!(
         "snapshot archives:\n\tfull: {:?}\n\tincr: {:?}",
-        snapshot_paths::get_full_snapshot_archives(
+        snapshot_paths::full_snapshot_archives_iter(
             validator_config.full_snapshot_archives_dir.path()
-        ),
-        snapshot_paths::get_incremental_snapshot_archives(
+        )
+        .collect::<Vec<_>>(),
+        snapshot_paths::incremental_snapshot_archives_iter(
             validator_config.incremental_snapshot_archives_dir.path()
-        ),
+        )
+        .collect::<Vec<_>>(),
     );
     info!("Waiting for validator to create snapshots... DONE");
 
@@ -5217,9 +5226,9 @@ fn test_duplicate_shreds_switch_failure() {
         dup_shred1: &Shred,
         dup_shred2: &Shred,
     ) {
-        let disable_turbine = Arc::new(AtomicBool::new(true));
+        let turbine_mode = TurbineMode::new(TurbineModeKind::TurbineAndRepairDisabled);
         duplicate_fork_validator_info.config.voting_disabled = false;
-        duplicate_fork_validator_info.config.turbine_disabled = disable_turbine.clone();
+        duplicate_fork_validator_info.config.turbine_mode = turbine_mode.clone();
         info!("Restarting node: {pubkey}");
         cluster.restart_node(
             pubkey,
@@ -5240,7 +5249,7 @@ fn test_duplicate_shreds_switch_failure() {
             }
             sleep(Duration::from_millis(1000));
         }
-        disable_turbine.store(false, Ordering::Relaxed);
+        turbine_mode.set(TurbineModeKind::Enabled);
 
         // Send the validator the other version of the shred so they realize it's duplicate
         info!("Resending duplicate shreds to duplicate fork validator");
@@ -6051,9 +6060,16 @@ fn test_alpenglow_imbalanced_stakes_catchup() {
     );
 }
 
-fn test_alpenglow_migration(num_nodes: usize) {
+fn test_alpenglow_migration(
+    num_nodes: usize,
+    test_name: &str,
+    leader_schedule: &[usize],
+) -> (
+    LocalCluster,
+    Vec<ValidatorKeys>,
+    /* migration slot */ Slot,
+) {
     agave_logger::setup_with_default(AG_DEBUG_LOG_FILTER);
-    let test_name = &format!("test_alpenglow_migration_{num_nodes}");
 
     let vote_listener_socket = bind_to_localhost_unique().unwrap();
     let vote_listener_addr = vote_listener_socket.try_clone().unwrap();
@@ -6064,17 +6080,11 @@ fn test_alpenglow_migration(num_nodes: usize) {
     });
     validator_config.wait_for_supermajority = Some(0);
 
-    let validator_keys = (0..num_nodes)
-        .map(|i| {
-            (
-                ValidatorKeys {
-                    node_keypair: Arc::new(keypair_from_seed(&[i as u8; 32]).unwrap()),
-                    vote_keypair: Arc::new(Keypair::new()),
-                },
-                true,
-            )
-        })
-        .collect::<Vec<_>>();
+    let (leader_schedule, keys) = create_custom_leader_schedule_with_random_keys(leader_schedule);
+
+    validator_config.fixed_leader_schedule = Some(FixedSchedule {
+        leader_schedule: Arc::new(leader_schedule),
+    });
     let node_stakes = vec![DEFAULT_NODE_STAKE; num_nodes];
 
     // We want the epochs to be as short as possible to reduce test time without being flaky.
@@ -6083,7 +6093,7 @@ fn test_alpenglow_migration(num_nodes: usize) {
     assert!(slots_per_epoch > MIGRATION_SLOT_OFFSET);
     let mut cluster_config = ClusterConfig {
         validator_configs: make_identical_validator_configs(&validator_config, num_nodes),
-        validator_keys: Some(validator_keys.clone()),
+        validator_keys: Some(keys.clone().into_iter().zip(iter::repeat(true)).collect()),
         node_stakes: node_stakes.clone(),
         slots_per_epoch,
         stakers_slot_offset: slots_per_epoch,
@@ -6172,6 +6182,7 @@ fn test_alpenglow_migration(num_nodes: usize) {
 
     // Additionally ensure that roots are being made
     cluster.check_for_new_roots(8, test_name, SocketAddrSpace::Unspecified);
+    (cluster, keys, migration_slot)
 }
 
 /// Single-node migration from legacy mode into Alpenglow after feature activation.
@@ -6179,7 +6190,7 @@ fn test_alpenglow_migration(num_nodes: usize) {
 #[test]
 #[serial]
 fn test_alpenglow_migration_1() {
-    test_alpenglow_migration(1)
+    test_alpenglow_migration(1, "test_alpenglow_migration_1", &[4]);
 }
 
 /// Multi-node migration into Alpenglow, including notarized-vote and root production
@@ -6187,5 +6198,69 @@ fn test_alpenglow_migration_1() {
 #[test]
 #[serial]
 fn test_alpenglow_migration_4() {
-    test_alpenglow_migration(4)
+    test_alpenglow_migration(4, "test_alpenglow_migration_4", &[4, 4, 4, 4]);
+}
+
+#[test]
+#[serial]
+fn test_alpenglow_restart_post_migration() {
+    let test_name = "test_alpenglow_restart_post_migration";
+
+    // Start a 2 node cluster and have it go through the migration
+    let (mut cluster, _, _) = test_alpenglow_migration(2, test_name, &[4, 4]);
+
+    // Now restart one of the nodes. This causes the cluster to temporarily halt
+    let node_pubkey = cluster.get_node_pubkeys()[0];
+    cluster.exit_restart_node(
+        &node_pubkey,
+        safe_clone_config(&cluster.validators.get(&node_pubkey).unwrap().config),
+        SocketAddrSpace::Unspecified,
+    );
+
+    // The restarted node will startup from genesis (0) so this test verifies the following:
+    // - When processing the feature flag activation during startup increment `PreFeatureActivation` ->  `Migration`
+    // - When processing the first alpenglow block during startup increment `Migration` -> `ReadyToEnable`
+    // - If we reach `ReadyToEnable` during startup, enable alpenglow
+    // - Ensure that during startup we set ticks correctly
+    cluster.check_for_new_roots(8, test_name, SocketAddrSpace::Unspecified);
+}
+
+#[test]
+#[serial]
+fn test_alpenglow_missed_migration_entirely() {
+    let test_name = "test_alpenglow_missed_migration_entirely";
+
+    // Start a 3 node cluster and have it go through the migration and root some slots
+    // Critical that the third node is not in the leader schedule, as since
+    // we clear blockstore later, we could end up producing duplicate blocks
+    let (mut cluster, validator_keys, migration_slot) =
+        test_alpenglow_migration(3, test_name, &[4, 4, 0]);
+
+    // Now kill the second node
+    let node_pubkey = validator_keys[2].node_keypair.pubkey();
+    let exit_info = cluster.exit_node(&node_pubkey);
+    let start_slot = migration_slot - 10;
+
+    // Clear blockstore to simulate the node partitioning before the migration period
+    info!("Clearing blockstore after slot {start_slot}");
+    {
+        let blockstore = Blockstore::open(&exit_info.info.ledger_path).unwrap();
+        let end_slot = blockstore.highest_slot().unwrap().unwrap();
+        blockstore.purge_from_next_slots(start_slot, end_slot);
+        blockstore
+            .purge_slots(start_slot, end_slot, PurgeType::Exact)
+            .unwrap();
+    }
+
+    // Restart the node.
+    // We have simulated the following situation:
+    // - Nodes 1 and 3 were enough to perform the migration. They finalized blocks after the migration
+    //   and are no longer broadcasting the GenesisCertificate.
+    // - Node 2 was completely partitioned off since 10 slots before the migration.
+    // - Node 2 now rejoins the network
+    // - It is able to use TowerBFT eager repair to fetch blocks, eventually it will see the
+    //   first Alpenglow block, attempt to process it as a TowerBFT block and switch to Alpenglow.
+    info!("Restarting node to a pre migration state");
+    cluster.restart_node(&node_pubkey, exit_info, SocketAddrSpace::Unspecified);
+    cluster.check_for_new_roots(8, test_name, SocketAddrSpace::Unspecified);
 }

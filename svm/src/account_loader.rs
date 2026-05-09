@@ -35,7 +35,6 @@ use {
     solana_transaction_context::{IndexOfAccount, transaction_accounts::KeyedAccountSharedData},
     solana_transaction_error::{TransactionError, TransactionResult as Result},
     std::cell::Cell,
-    std::num::NonZeroU32,
     std::sync::atomic::{AtomicU64, Ordering},
     std::time::Instant,
 };
@@ -119,8 +118,7 @@ impl Default for CheckedTransactionDetails {
             nonce_address: None,
             compute_budget_and_limits: SVMTransactionExecutionAndFeeBudgetLimits {
                 budget: SVMTransactionExecutionBudget::default(),
-                loaded_accounts_data_size_limit: NonZeroU32::new(32)
-                    .expect("Failed to set loaded_accounts_bytes"),
+                loaded_accounts_data_size_limit: 32,
                 fee_details: FeeDetails::default(),
             },
         }
@@ -143,7 +141,7 @@ impl CheckedTransactionDetails {
 pub(crate) struct ValidatedTransactionDetails {
     pub(crate) rollback_accounts: RollbackAccounts,
     pub(crate) compute_budget: SVMTransactionExecutionBudget,
-    pub(crate) loaded_accounts_bytes_limit: NonZeroU32,
+    pub(crate) loaded_accounts_bytes_limit: u32,
     pub(crate) fee_details: FeeDetails,
     pub(crate) loaded_fee_payer_account: LoadedTransactionAccount,
 }
@@ -155,7 +153,7 @@ impl Default for ValidatedTransactionDetails {
             rollback_accounts: RollbackAccounts::default(),
             compute_budget: SVMTransactionExecutionBudget::default(),
             loaded_accounts_bytes_limit:
-                solana_program_runtime::execution_budget::MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
+                solana_program_runtime::execution_budget::MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES.get(),
             fee_details: FeeDetails::default(),
             loaded_fee_payer_account: LoadedTransactionAccount::default(),
         }
@@ -201,7 +199,6 @@ pub struct FeesOnlyTransaction {
 pub(crate) struct AccountLoader<'a, CB: TransactionProcessingCallback> {
     loaded_accounts: AHashMap<Pubkey, (AccountSharedData, Slot)>,
     callbacks: &'a CB,
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) feature_set: &'a SVMFeatureSet,
 }
 
@@ -485,13 +482,19 @@ pub(crate) fn load_transaction<CB: TransactionProcessingCallback>(
                     fee_details: tx_details.fee_details,
                     rollback_accounts: tx_details.rollback_accounts,
                     compute_budget: tx_details.compute_budget,
-                    loaded_accounts_data_size: loaded_transaction_data_size
-                        .loaded_accounts_data_size,
+                    loaded_accounts_data_size: loaded_transaction_data_size.into(),
                 }),
                 Err(err) => TransactionLoadResult::FeesOnly(FeesOnlyTransaction {
                     load_error: err,
                     fee_details: tx_details.fee_details,
-                    loaded_accounts_data_size: tx_details.rollback_accounts.data_size() as u32,
+                    loaded_accounts_data_size: if account_loader
+                        .feature_set
+                        .define_ltds_fee_only_semantics
+                    {
+                        loaded_transaction_data_size.into()
+                    } else {
+                        tx_details.rollback_accounts.data_size() as u32
+                    },
                     rollback_accounts: tx_details.rollback_accounts,
                 }),
             }
@@ -501,16 +504,15 @@ pub(crate) fn load_transaction<CB: TransactionProcessingCallback>(
 
 #[derive(PartialEq, Eq, Debug, Clone)]
 struct LoadedTransactionDataSize {
-    pub(crate) loaded_accounts_data_size: u32,
-    pub(crate) requested_loaded_accounts_data_size_limit: u32,
+    loaded_accounts_data_size: u32,
+    requested_loaded_accounts_data_size_limit: u32,
 }
 
 impl LoadedTransactionDataSize {
-    fn with_max_size(requested_loaded_accounts_data_size_limit: NonZeroU32) -> Self {
+    fn with_max_size(requested_loaded_accounts_data_size_limit: u32) -> Self {
         Self {
             loaded_accounts_data_size: 0,
-            requested_loaded_accounts_data_size_limit: requested_loaded_accounts_data_size_limit
-                .get(),
+            requested_loaded_accounts_data_size_limit,
         }
     }
 
@@ -519,7 +521,10 @@ impl LoadedTransactionDataSize {
         data_size_delta: usize,
         error_metrics: &mut TransactionErrorMetrics,
     ) -> Result<()> {
+        // this branch is unreachable in practice (though not by construction),
+        // since it would imply an account >4gb in size
         let Ok(data_size_delta) = u32::try_from(data_size_delta) else {
+            self.loaded_accounts_data_size = u32::MAX;
             error_metrics.max_loaded_accounts_data_size_exceeded += 1;
             return Err(TransactionError::MaxLoadedAccountsDataSizeExceeded);
         };
@@ -534,6 +539,14 @@ impl LoadedTransactionDataSize {
         } else {
             Ok(())
         }
+    }
+}
+
+impl From<LoadedTransactionDataSize> for u32 {
+    fn from(value: LoadedTransactionDataSize) -> Self {
+        value
+            .loaded_accounts_data_size
+            .min(value.requested_loaded_accounts_data_size_limit)
     }
 }
 
@@ -1187,22 +1200,40 @@ mod tests {
     fn test_increase_calculated_data_size() {
         let mut error_metrics = TransactionErrorMetrics::default();
         let data_size: usize = 123;
-        let requested_data_size_limit = NonZeroU32::new(data_size as u32).unwrap();
+        let requested_data_size_limit = data_size as u32 + 1;
         let mut acc = LoadedTransactionDataSize::with_max_size(requested_data_size_limit);
 
-        // OK - loaded data size is up to limit
+        // OK - loaded data size is under limit
         assert!(
             acc.increase_calculated_data_size(data_size, &mut error_metrics)
                 .is_ok()
         );
-        assert_eq!(data_size as u32, acc.loaded_accounts_data_size);
+        assert_eq!(data_size as u32, acc.clone().into());
 
-        // fail - loading more data that would exceed limit
-        let another_byte: usize = 1;
+        // OK - loaded data size meets limit
+        assert!(
+            acc.increase_calculated_data_size(1, &mut error_metrics)
+                .is_ok()
+        );
+        assert_eq!(requested_data_size_limit, acc.clone().into());
+
+        // fail - loading more data would exceed limit
+        // data size helper reports the limit only
         assert_eq!(
-            acc.increase_calculated_data_size(another_byte, &mut error_metrics),
+            acc.increase_calculated_data_size(1, &mut error_metrics),
             Err(TransactionError::MaxLoadedAccountsDataSizeExceeded)
         );
+        assert_eq!(requested_data_size_limit, acc.into());
+
+        let mut acc = LoadedTransactionDataSize::with_max_size(requested_data_size_limit);
+
+        // fail - adding a huge number exceeds limit
+        // data size helper correctly reports we hit the limit
+        assert_eq!(
+            acc.increase_calculated_data_size(u32::MAX as usize + 1, &mut error_metrics),
+            Err(TransactionError::MaxLoadedAccountsDataSizeExceeded)
+        );
+        assert_eq!(requested_data_size_limit, acc.into());
     }
 
     struct ValidateFeePayerTestParameter {
@@ -1376,7 +1407,7 @@ mod tests {
         let mut error_metrics = TransactionErrorMetrics::default();
 
         let mut loaded_transaction_data_size =
-            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES);
+            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES.get());
 
         let sanitized_transaction = SanitizedTransaction::new_for_tests(
             sanitized_message,
@@ -1430,7 +1461,7 @@ mod tests {
         let mut error_metrics = TransactionErrorMetrics::default();
 
         let mut loaded_transaction_data_size =
-            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES);
+            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES.get());
 
         let sanitized_transaction = SanitizedTransaction::new_for_tests(
             sanitized_message,
@@ -1484,7 +1515,7 @@ mod tests {
         let mut error_metrics = TransactionErrorMetrics::default();
 
         let mut loaded_transaction_data_size =
-            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES);
+            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES.get());
 
         let sanitized_transaction = SanitizedTransaction::new_for_tests(
             sanitized_message,
@@ -1531,7 +1562,7 @@ mod tests {
         let mut error_metrics = TransactionErrorMetrics::default();
 
         let mut loaded_transaction_data_size =
-            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES);
+            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES.get());
 
         let sanitized_transaction = SanitizedTransaction::new_for_tests(
             sanitized_message,
@@ -1594,7 +1625,7 @@ mod tests {
         let mut error_metrics = TransactionErrorMetrics::default();
 
         let mut loaded_transaction_data_size =
-            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES);
+            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES.get());
 
         let sanitized_transaction = SanitizedTransaction::new_for_tests(
             sanitized_message,
@@ -1666,7 +1697,7 @@ mod tests {
         let mut error_metrics = TransactionErrorMetrics::default();
 
         let mut loaded_transaction_data_size =
-            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES);
+            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES.get());
 
         let sanitized_transaction = SanitizedTransaction::new_for_tests(
             sanitized_message,
@@ -1725,7 +1756,7 @@ mod tests {
         let mut error_metrics = TransactionErrorMetrics::default();
 
         let mut loaded_transaction_data_size =
-            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES);
+            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES.get());
 
         let sanitized_transaction = SanitizedTransaction::new_for_tests(
             sanitized_message,
@@ -1798,7 +1829,7 @@ mod tests {
         );
 
         let mut loaded_transaction_data_size =
-            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES);
+            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES.get());
 
         let result = load_transaction_accounts(
             &mut account_loader,
@@ -1888,7 +1919,7 @@ mod tests {
         );
 
         let mut loaded_transaction_data_size =
-            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES);
+            LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES.get());
 
         let result = load_transaction_accounts(
             &mut account_loader,
@@ -2532,7 +2563,7 @@ mod tests {
             assert!(expected_size <= MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES.get() as usize);
 
             let mut loaded_transaction_data_size =
-                LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES);
+                LoadedTransactionDataSize::with_max_size(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES.get());
 
             load_transaction_accounts(
                 &mut account_loader,
